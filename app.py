@@ -5,18 +5,10 @@ import matplotlib.pyplot as plt
 import datetime
 import base64
 
-# -------------------------------------------------
-# PAGE CONFIG
-# -------------------------------------------------
-
-st.set_page_config(
-    page_title="Thermozone Analyst",
-    layout="wide",
-    page_icon="☀️"
-)
+st.set_page_config(page_title="Thermozone Analyst",layout="wide")
 
 # -------------------------------------------------
-# BACKGROUND IMAGE
+# BACKGROUND
 # -------------------------------------------------
 
 def set_background():
@@ -26,24 +18,23 @@ def set_background():
 
     encoded = base64.b64encode(img).decode()
 
-    css = f"""
+    st.markdown(
+    f"""
     <style>
     .stApp {{
-        background-image: url("data:image/jpg;base64,{encoded}");
-        background-size: cover;
-        background-position: center;
-        background-attachment: fixed;
+        background-image:url("data:image/jpg;base64,{encoded}");
+        background-size:cover;
+        background-attachment:fixed;
     }}
 
     .block-container {{
-        background-color: rgba(0,0,0,0.65);
-        padding: 2rem;
-        border-radius: 15px;
+        background:rgba(0,0,0,0.65);
+        padding:2rem;
+        border-radius:15px;
     }}
     </style>
-    """
-
-    st.markdown(css, unsafe_allow_html=True)
+    """,
+    unsafe_allow_html=True)
 
 set_background()
 
@@ -51,23 +42,14 @@ set_background()
 # HEADER
 # -------------------------------------------------
 
-st.markdown(
-"""
-<h1 style='text-align:center;color:white;'>Thermozone Analyst</h1>
-<h4 style='text-align:center;color:white;'>Dynamic Cooling Load Simulation Tool</h4>
-""",
-unsafe_allow_html=True
-)
-
-st.write("")
+st.title("☀️ Thermozone Analyst")
+st.subheader("Dynamic Cooling Load Simulation")
 
 # -------------------------------------------------
-# SIDEBAR INPUTS
+# LOCATION
 # -------------------------------------------------
 
-st.sidebar.header("Simulation Inputs")
-
-location = st.sidebar.text_input("City / Address")
+location = st.text_input("City / Address")
 
 # -------------------------------------------------
 # ROOM
@@ -75,15 +57,15 @@ location = st.sidebar.text_input("City / Address")
 
 st.header("Room Geometry")
 
-col1,col2,col3 = st.columns(3)
+c1,c2,c3 = st.columns(3)
 
-with col1:
+with c1:
     room_length = st.number_input("Room Length (m)",value=10.0)
 
-with col2:
+with c2:
     room_width = st.number_input("Room Width (m)",value=7.0)
 
-with col3:
+with c3:
     room_height = st.number_input("Room Height (m)",value=2.7)
 
 room_volume = room_length*room_width*room_height
@@ -107,7 +89,6 @@ Cp_air = 1005
 st.header("Exterior Walls")
 
 num_walls = st.number_input("Number of exterior walls",1,8,4)
-
 wall_U = st.number_input("Wall U-value",value=1.8)
 
 direction_map = {
@@ -117,73 +98,39 @@ direction_map = {
 
 walls=[]
 windows=[]
-window_labels=[]
 
 for i in range(int(num_walls)):
 
     st.subheader(f"Wall {i+1}")
 
-    col1,col2,col3 = st.columns(3)
+    direction = st.selectbox(
+        "Orientation",
+        list(direction_map.keys()),
+        key=f"dir{i}"
+    )
 
-    with col1:
-        direction = st.selectbox(
-            "Orientation",
-            list(direction_map.keys()),
-            key=f"dir{i}"
-        )
-
-    with col2:
-        wall_length = st.number_input(
-            "Wall Length (m)",
-            key=f"wl{i}",
-            value=7.0
-        )
-
-    with col3:
-        wall_height = st.number_input(
-            "Wall Height (m)",
-            key=f"wh{i}",
-            value=2.7
-        )
+    wall_length = st.number_input("Wall Length (m)",key=f"wl{i}",value=7.0)
+    wall_height = st.number_input("Wall Height (m)",key=f"wh{i}",value=2.7)
 
     wall_area = wall_length*wall_height
 
-    window_present = st.checkbox(
-        "Windows on this wall",
-        key=f"wp{i}"
-    )
+    window_present = st.checkbox("Windows on this wall",key=f"wp{i}")
 
     window_area=0
 
     if window_present:
 
-        num_win = st.number_input(
-            "Number of windows",
-            1,10,
-            key=f"nw{i}"
-        )
+        num_win = st.number_input("Number of windows",1,10,key=f"nw{i}")
 
         for j in range(int(num_win)):
 
             st.write(f"Window {j+1}")
 
-            col1,col2 = st.columns(2)
-
-            with col1:
-                w = st.number_input(
-                    "Width (m)",
-                    key=f"ww{i}{j}",
-                    value=2.0
-                )
-
-            with col2:
-                h = st.number_input(
-                    "Height (m)",
-                    key=f"wh{i}{j}",
-                    value=1.5
-                )
+            w = st.number_input("Width (m)",key=f"ww{i}{j}",value=2.0)
+            h = st.number_input("Height (m)",key=f"wh{i}{j}",value=1.5)
 
             area = w*h
+
             window_area += area
 
             windows.append({
@@ -191,8 +138,6 @@ for i in range(int(num_walls)):
                 "azimuth":direction_map[direction],
                 "area":area
             })
-
-            window_labels.append(f"{direction} window")
 
     net_wall_area = wall_area - window_area
 
@@ -208,18 +153,12 @@ for i in range(int(num_walls)):
 
 st.header("Material Properties")
 
-col1,col2,col3 = st.columns(3)
+SHGC = st.number_input("Glass SHGC",value=0.3)
+glass_U = st.number_input("Glass U-value",value=2.7)
 
-with col1:
-    SHGC = st.number_input("Glass SHGC",value=0.3)
+Tin = st.number_input("Indoor Temperature (°C)",value=24)
 
-with col2:
-    glass_U = st.number_input("Glass U-value",value=2.7)
-
-with col3:
-    Tin = st.number_input("Indoor Temp (°C)",value=24.0)
-
-roof_present = st.checkbox("Roof exposed")
+roof_present = st.checkbox("Roof Exposed")
 
 roof_U = st.number_input("Roof U-value",value=2.8) if roof_present else 0
 
@@ -227,11 +166,7 @@ roof_U = st.number_input("Roof U-value",value=2.8) if roof_present else 0
 # RUN SIMULATION
 # -------------------------------------------------
 
-run = st.button("Run Simulation")
-
-if run and location:
-
-    st.info("Fetching weather data...")
+if st.button("Run Simulation") and location:
 
     geo_url="https://nominatim.openstreetmap.org/search"
 
@@ -296,10 +231,6 @@ if run and location:
     roof_cond=[]
     inf_gain=[]
 
-    # --------------------------------
-    # SIMULATION LOOP
-    # --------------------------------
-
     for h in hours:
 
         ghi=GHI[h]
@@ -309,6 +240,10 @@ if run and location:
 
         dec=declination(day)
         ha=hour_angle(h)
+
+        # --------------------------
+        # SOLAR ALTITUDE
+        # --------------------------
 
         alt=math.degrees(math.asin(
             math.sin(math.radians(latitude))*math.sin(math.radians(dec))
@@ -322,10 +257,22 @@ if run and location:
             wall_cond.append(0)
             roof_cond.append(0)
             inf_gain.append(0)
-
             continue
 
-        az=180
+        # --------------------------
+        # SOLAR AZIMUTH
+        # --------------------------
+
+        sin_az = (
+            math.cos(math.radians(dec))*math.sin(math.radians(ha))
+        ) / math.cos(math.radians(alt))
+
+        az = math.degrees(math.asin(sin_az))
+
+        if ha>0:
+            az = 180-az
+        else:
+            az = 180+az
 
         # --------------------------
         # WINDOW SOLAR GAIN
@@ -354,7 +301,7 @@ if run and location:
         Qglass=sum(glass_U*w["area"]*(To-Tin) for w in windows)
 
         # --------------------------
-        # WALL CONDUCTION
+        # WALL SOL-AIR
         # --------------------------
 
         Qwall=0
@@ -394,10 +341,6 @@ if run and location:
     total_load=[solar_gain[i]+glass_cond[i]+wall_cond[i]+roof_cond[i]+inf_gain[i] for i in range(24)]
 
     peak=max(total_load)
-
-    # -------------------------------------------------
-    # RESULTS
-    # -------------------------------------------------
 
     st.metric("Peak Cooling Load",f"{round(peak,2)} W")
     st.metric("Estimated AC Capacity",f"{round(peak/3517,2)} TR")
