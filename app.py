@@ -3,352 +3,366 @@ import requests
 import math
 import matplotlib.pyplot as plt
 import datetime
-import base64
 
-# ---------------------------------
-# PAGE CONFIG
-# ---------------------------------
+st.set_page_config(page_title="Thermozone Analyst", layout="wide")
 
-st.set_page_config(
-    page_title="Thermozone Analyst",
-    layout="wide",
-    page_icon="☀️"
-)
+st.title("☀️ Thermozone Analyst")
+st.subheader("Dynamic Cooling Load Simulator")
 
-# ---------------------------------
-# BACKGROUND
-# ---------------------------------
+# -----------------------------
+# LOCATION
+# -----------------------------
 
-def set_bg():
+location = st.text_input("Enter City / Address")
 
-    with open("background.jpg","rb") as f:
-        data = f.read()
+# -----------------------------
+# ROOM DIMENSIONS
+# -----------------------------
 
-    encoded = base64.b64encode(data).decode()
+st.header("Room Dimensions")
 
-    css = f"""
-    <style>
-    .stApp {{
-        background-image: url("data:image/jpg;base64,{encoded}");
-        background-size: cover;
-        background-position: center;
-        background-attachment: fixed;
-    }}
-    </style>
-    """
+room_length = st.number_input("Room length (m)",value=10.0)
+room_width = st.number_input("Room width (m)",value=7.0)
+room_height = st.number_input("Room height (m)",value=2.7)
 
-    st.markdown(css, unsafe_allow_html=True)
+room_volume = room_length*room_width*room_height
+roof_area = room_length*room_width
 
-set_bg()
+# -----------------------------
+# INFILTRATION
+# -----------------------------
 
-# ---------------------------------
-# HEADER
-# ---------------------------------
+st.header("Air Infiltration")
 
-st.markdown(
-"""
-<h1 style='text-align:center;color:white;'>Thermozone Analyst</h1>
-<h4 style='text-align:center;color:white;'>Dynamic Cooling Load Simulator</h4>
-""",
-unsafe_allow_html=True
-)
+ACH = st.number_input("Air Changes per Hour",value=0.5)
 
-# ---------------------------------
-# SIDEBAR INPUTS
-# ---------------------------------
+rho_air = 1.2
+Cp_air = 1005
 
-st.sidebar.header("Simulation Inputs")
+# -----------------------------
+# WALL INPUTS
+# -----------------------------
 
-location = st.sidebar.text_input("City / Address")
+st.header("Exterior Walls")
 
-room_length = st.sidebar.number_input("Room Length (m)",value=10.0)
-room_width = st.sidebar.number_input("Room Width (m)",value=7.0)
-room_height = st.sidebar.number_input("Room Height (m)",value=2.7)
+num_walls = st.number_input("Number of exterior walls",1,8,4)
 
-ACH = st.sidebar.number_input("Air Changes per Hour",value=0.5)
+wall_U = st.number_input("Wall U-value",value=1.8)
 
-wall_U = st.sidebar.number_input("Wall U Value",value=1.8)
-
-glass_U = st.sidebar.number_input("Glass U Value",value=2.7)
-
-SHGC = st.sidebar.number_input("Glass SHGC",value=0.3)
-
-roof_exposed = st.sidebar.checkbox("Roof Exposed")
-
-roof_U = st.sidebar.number_input("Roof U Value",value=2.8) if roof_exposed else 0
-
-Tin = st.sidebar.number_input("Indoor Temperature (°C)",value=24.0)
-
-# Window Inputs
-
-st.sidebar.header("Window Inputs")
-
-num_windows = st.sidebar.number_input("Number of Windows",1,10,3)
-
-windows = []
-
-directions = {
+direction_map = {
 "N":0,"NE":45,"E":90,"SE":135,
 "S":180,"SW":225,"W":270,"NW":315
 }
 
-for i in range(num_windows):
+walls = []
+windows = []
+window_labels = []
 
-    st.sidebar.subheader(f"Window {i+1}")
+for i in range(int(num_walls)):
 
-    direction = st.sidebar.selectbox(
+    st.subheader(f"Wall {i+1}")
+
+    direction = st.selectbox(
         "Orientation",
-        list(directions.keys()),
-        key=i
+        list(direction_map.keys()),
+        key=f"dir{i}"
     )
 
-    width = st.sidebar.number_input(
-        "Width (m)",
-        key=f"w{i}",
-        value=2.0
+    wall_length = st.number_input(
+        "Wall length (m)",
+        key=f"wl{i}",
+        value=7.0
     )
 
-    height = st.sidebar.number_input(
-        "Height (m)",
-        key=f"h{i}",
-        value=1.5
+    wall_height = st.number_input(
+        "Wall height (m)",
+        key=f"wh{i}",
+        value=2.7
     )
 
-    windows.append({
-        "area":width*height,
-        "azimuth":directions[direction]
-    })
+    wall_area = wall_length * wall_height
 
-run = st.sidebar.button("Run Simulation")
+    window_present = st.checkbox(
+        "Windows on this wall?",
+        key=f"wp{i}"
+    )
 
-# ---------------------------------
-# SIMULATION
-# ---------------------------------
+    window_area = 0
 
-if run and location:
+    if window_present:
 
-    with st.spinner("Running simulation..."):
-
-        # ------------------------------
-        # GEOLOCATION
-        # ------------------------------
-
-        geo_url="https://nominatim.openstreetmap.org/search"
-
-        params={"q":location,"format":"json","limit":1}
-
-        response=requests.get(
-            geo_url,
-            params=params,
-            headers={"User-Agent":"thermal-model"}
+        num_win = st.number_input(
+            "Number of windows",
+            1,
+            10,
+            key=f"nw{i}"
         )
 
-        data=response.json()
+        for j in range(int(num_win)):
 
-        lat=float(data[0]["lat"])
-        lon=float(data[0]["lon"])
+            st.write(f"Window {j+1}")
 
-        st.success(f"Location: {data[0]['display_name']}")
+            w = st.number_input(
+                "Width (m)",
+                key=f"ww{i}{j}",
+                value=2.0
+            )
 
-        # ------------------------------
-        # WEATHER
-        # ------------------------------
+            h = st.number_input(
+                "Height (m)",
+                key=f"wh{i}{j}",
+                value=1.5
+            )
 
-        url="https://api.open-meteo.com/v1/forecast"
+            area = w*h
 
-        params={
-            "latitude":lat,
-            "longitude":lon,
-            "hourly":"shortwave_radiation,direct_radiation,diffuse_radiation,temperature_2m",
-            "forecast_days":1,
-            "timezone":"auto"
-        }
+            window_area += area
 
-        weather=requests.get(url,params=params).json()
+            windows.append({
+                "direction":direction,
+                "azimuth":direction_map[direction],
+                "area":area
+            })
 
-        GHI=weather["hourly"]["shortwave_radiation"]
-        DNI=weather["hourly"]["direct_radiation"]
-        DHI=weather["hourly"]["diffuse_radiation"]
-        Tout=weather["hourly"]["temperature_2m"]
+            window_labels.append(direction+" window")
 
-        hours=list(range(24))
+    net_wall_area = wall_area - window_area
 
-        # ------------------------------
-        # ROOM
-        # ------------------------------
+    walls.append({
+        "direction":direction,
+        "azimuth":direction_map[direction],
+        "area":net_wall_area
+    })
 
-        volume = room_length*room_width*room_height
-        roof_area = room_length*room_width
+# -----------------------------
+# GLASS + ROOF
+# -----------------------------
 
-        rho_air=1.2
-        Cp_air=1005
+st.header("Material Properties")
 
-        # ------------------------------
-        # SOLAR FUNCTIONS
-        # ------------------------------
+SHGC = st.number_input("Glass SHGC",value=0.3)
+glass_U = st.number_input("Glass U-value",value=2.7)
 
-        def declination(n):
-            return 23.45*math.sin(math.radians((360*(284+n))/365))
+roof_present = st.checkbox("Roof exposed")
 
-        def hour_angle(h):
-            return 15*(h-12)
+if roof_present:
+    roof_U = st.number_input("Roof U-value",value=2.8)
+else:
+    roof_U = 0
 
-        today=datetime.datetime.now()
-        day=today.timetuple().tm_yday
+Tin = st.number_input("Indoor Temperature (°C)",value=24.0)
 
-        # ------------------------------
-        # ARRAYS
-        # ------------------------------
+# -----------------------------
+# RUN SIMULATION
+# -----------------------------
 
-        solar=[]
-        glass=[]
-        wall=[]
-        roof=[]
-        inf=[]
-        total=[]
+if st.button("Run Simulation") and location:
 
-        rho_g=0.2
-        alpha_wall=0.6
-        h_out=20
+    st.write("Fetching weather data...")
 
-        # ------------------------------
-        # MAIN LOOP
-        # ------------------------------
+    geo_url = "https://nominatim.openstreetmap.org/search"
 
-        for h in hours:
+    params = {"q":location,"format":"json","limit":1}
 
-            ghi=GHI[h]
-            dni=DNI[h]
-            dhi=DHI[h]
-            To=Tout[h]
+    response = requests.get(
+        geo_url,
+        params=params,
+        headers={"User-Agent":"thermal-model"}
+    )
 
-            dec=declination(day)
-            ha=hour_angle(h)
+    data = response.json()
 
-            alt=math.degrees(math.asin(
-                math.sin(math.radians(lat))*math.sin(math.radians(dec))
-                +math.cos(math.radians(lat))*math.cos(math.radians(dec))*math.cos(math.radians(ha))
-            ))
+    latitude = float(data[0]["lat"])
+    longitude = float(data[0]["lon"])
 
-            if alt<=0:
+    st.success(data[0]["display_name"])
 
-                solar.append(0)
-                glass.append(0)
-                wall.append(0)
-                roof.append(0)
-                inf.append(0)
-                total.append(0)
+    # -----------------------------
+    # WEATHER DATA
+    # -----------------------------
 
-                continue
+    url = "https://api.open-meteo.com/v1/forecast"
 
-            az=180
+    params = {
+        "latitude":latitude,
+        "longitude":longitude,
+        "hourly":"shortwave_radiation,direct_radiation,diffuse_radiation,temperature_2m",
+        "forecast_days":1,
+        "timezone":"auto"
+    }
 
-            # ------------------------------
-            # WINDOW SOLAR
-            # ------------------------------
+    weather = requests.get(url,params=params).json()
 
-            Qsolar=0
+    GHI = weather["hourly"]["shortwave_radiation"]
+    DNI = weather["hourly"]["direct_radiation"]
+    DHI = weather["hourly"]["diffuse_radiation"]
+    Tout = weather["hourly"]["temperature_2m"]
 
-            for w in windows:
+    hours = list(range(24))
 
-                theta=abs(az-w["azimuth"])
+    # -----------------------------
+    # SOLAR GEOMETRY
+    # -----------------------------
 
-                cos_theta=max(math.cos(math.radians(theta)),0)
+    def declination(n):
+        return 23.45*math.sin(math.radians((360*(284+n))/365))
 
-                beam=dni*cos_theta
-                diffuse=dhi*0.5
-                ground=ghi*rho_g*0.5
+    def hour_angle(h):
+        return 15*(h-12)
 
-                I=beam+diffuse+ground
+    today = datetime.datetime.now()
+    day = today.timetuple().tm_yday
 
-                Qsolar+=w["area"]*SHGC*I
+    rho_g = 0.2
+    alpha_wall = 0.6
+    h_out = 20
 
-            # ------------------------------
-            # GLASS CONDUCTION
-            # ------------------------------
+    solar_gain=[]
+    glass_cond=[]
+    wall_cond=[]
+    roof_cond=[]
+    inf_gain=[]
 
-            Qglass=sum(glass_U*w["area"]*(To-Tin) for w in windows)
+    window_gain_map={i:[] for i in range(len(windows))}
 
-            # ------------------------------
-            # WALL CONDUCTION (SOL AIR)
-            # ------------------------------
+    # -----------------------------
+    # MAIN LOOP
+    # -----------------------------
 
-            Tsolair=To+(alpha_wall*ghi/h_out)
+    for h in hours:
 
-            wall_area=(room_length+room_width)*2*room_height
+        ghi = GHI[h]
+        dni = DNI[h]
+        dhi = DHI[h]
+        To = Tout[h]
 
-            Qwall=wall_U*wall_area*(Tsolair-Tin)
+        dec = declination(day)
+        ha = hour_angle(h)
 
-            # ------------------------------
-            # ROOF
-            # ------------------------------
+        alt = math.degrees(math.asin(
+            math.sin(math.radians(latitude))*math.sin(math.radians(dec))
+            + math.cos(math.radians(latitude))*math.cos(math.radians(dec))*math.cos(math.radians(ha))
+        ))
 
-            Tsolair_roof=To+(alpha_wall*ghi/h_out)
+        if alt <= 0:
 
-            Qroof=roof_U*roof_area*(Tsolair_roof-Tin)
+            solar_gain.append(0)
+            glass_cond.append(0)
+            wall_cond.append(0)
+            roof_cond.append(0)
+            inf_gain.append(0)
 
-            # ------------------------------
-            # INFILTRATION
-            # ------------------------------
+            for i in range(len(windows)):
+                window_gain_map[i].append(0)
 
-            Qinf=(rho_air*Cp_air*ACH*volume*(To-Tin))/3600
+            continue
 
-            # ------------------------------
-            # TOTAL
-            # ------------------------------
+        az = 180
 
-            Qtotal=Qsolar+Qglass+Qwall+Qroof+Qinf
+        # -----------------------------
+        # WINDOW SOLAR GAIN
+        # -----------------------------
 
-            solar.append(Qsolar)
-            glass.append(Qglass)
-            wall.append(Qwall)
-            roof.append(Qroof)
-            inf.append(Qinf)
-            total.append(Qtotal)
+        Qsolar = 0
 
-        peak=max(total)
+        for i,w in enumerate(windows):
 
-# ---------------------------------
-# DASHBOARD METRICS
-# ---------------------------------
+            theta = abs(az - w["azimuth"])
 
-        c1,c2,c3=st.columns(3)
+            cos_theta = max(math.cos(math.radians(theta)),0)
 
-        c1.metric("Peak Cooling Load",f"{round(peak,2)} W")
+            beam = dni*cos_theta
+            diffuse = dhi*0.5
+            ground = ghi*rho_g*0.5
 
-        c2.metric("AC Capacity",f"{round(peak/3517,2)} TR")
+            I = beam + diffuse + ground
 
-        c3.metric("Room Area",f"{round(room_length*room_width,2)} m²")
+            q = w["area"]*SHGC*I
 
-# ---------------------------------
-# GRAPHS
-# ---------------------------------
+            Qsolar += q
+            window_gain_map[i].append(q)
 
-        tab1,tab2=st.tabs(["Cooling Load","Heat Gain Components"])
+        # -----------------------------
+        # GLASS CONDUCTION
+        # -----------------------------
 
-        with tab1:
+        Qglass = sum(glass_U*w["area"]*(To-Tin) for w in windows)
 
-            fig,ax=plt.subplots()
+        # -----------------------------
+        # WALL SOL-AIR
+        # -----------------------------
 
-            ax.plot(hours,total,label="Total Load",linewidth=3)
+        Qwall = 0
 
-            ax.set_xlabel("Hour")
-            ax.set_ylabel("Heat Gain W")
-            ax.grid()
+        for wall in walls:
 
-            st.pyplot(fig)
+            theta = abs(az - wall["azimuth"])
 
-        with tab2:
+            cos_theta = max(math.cos(math.radians(theta)),0)
 
-            fig2,ax2=plt.subplots()
+            Iwall = dni*cos_theta + 0.5*dhi
 
-            ax2.plot(hours,solar,label="Solar Gain")
-            ax2.plot(hours,glass,label="Glass Conduction")
-            ax2.plot(hours,wall,label="Wall Gain")
-            ax2.plot(hours,roof,label="Roof Gain")
-            ax2.plot(hours,inf,label="Infiltration")
+            Tsolair = To + (alpha_wall*Iwall/h_out)
 
-            ax2.legend()
-            ax2.grid()
+            Qwall += wall_U*wall["area"]*(Tsolair-Tin)
 
-            st.pyplot(fig2)
+        # -----------------------------
+        # ROOF
+        # -----------------------------
+
+        Tsolair_roof = To + (alpha_wall*ghi/h_out)
+
+        Qroof = roof_U*roof_area*(Tsolair_roof-Tin)
+
+        # -----------------------------
+        # INFILTRATION
+        # -----------------------------
+
+        Qinf = (rho_air*Cp_air*ACH*room_volume*(To-Tin))/3600
+
+        solar_gain.append(Qsolar)
+        glass_cond.append(Qglass)
+        wall_cond.append(Qwall)
+        roof_cond.append(Qroof)
+        inf_gain.append(Qinf)
+
+    # -----------------------------
+    # TOTAL LOAD
+    # -----------------------------
+
+    total_load = []
+
+    for i in range(24):
+
+        total = (
+            solar_gain[i]
+            + glass_cond[i]
+            + wall_cond[i]
+            + roof_cond[i]
+            + inf_gain[i]
+        )
+
+        total_load.append(total)
+
+    peak = max(total_load)
+
+    st.metric("Peak Cooling Load",f"{round(peak,2)} W")
+    st.metric("AC Capacity",f"{round(peak/3517,2)} TR")
+
+    # -----------------------------
+    # GRAPH
+    # -----------------------------
+
+    fig,ax = plt.subplots()
+
+    ax.plot(hours,solar_gain,label="Solar Gain")
+    ax.plot(hours,glass_cond,label="Glass Conduction")
+    ax.plot(hours,wall_cond,label="Wall Gain")
+    ax.plot(hours,roof_cond,label="Roof Gain")
+    ax.plot(hours,inf_gain,label="Infiltration")
+    ax.plot(hours,total_load,label="Total Load",linewidth=3)
+
+    ax.legend()
+    ax.grid()
+
+    st.pyplot(fig)
