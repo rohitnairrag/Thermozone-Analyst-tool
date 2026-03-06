@@ -257,7 +257,7 @@ if location:
         ax.plot(hours,wall_cond,label="Wall Gain")
         ax.plot(hours,roof_cond,label="Roof Gain")
         ax.plot(hours,inf_gain,label="Infiltration")
-        ax.plot(hours,total_load,label="Total Cooling Load",linewidth=3)
+        ax.plot(hours,total_load,label="Total Heat Load",linewidth=3)
 
         ax.set_xlabel("Hour")
         ax.set_ylabel("Heat Gain (W)")
@@ -280,5 +280,5 @@ if location:
 
         peak=max(total_load)
 
-        st.write("Peak Cooling Load:",round(peak,2),"W")
+        st.write("Peak Heat Load:",round(peak,2),"W")
         st.write("Approx AC Capacity:",round(peak/3517,2),"TR")
