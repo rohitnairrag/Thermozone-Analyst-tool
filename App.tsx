@@ -8,8 +8,8 @@ import {
   SimulationResult, ACUnit, ZoneProfile, WallDef, Direction,
   LocationData, HourlyWeather, ConstructionType, EmbeddedWindow
 } from './types';
-import { searchLocation, fetchWeather } from './services/weatherService';
-import { fetchLiveRoomTemp, LiveTempData } from './services/liveDataService';
+import { searchLocation, fetchWeather, fetchWeatherForDate } from './services/weatherService';
+import { fetchLiveRoomTemp, fetchHistoricalTemps, fetchHistoricalAcOutput, LiveTempData, HistoricalTempData, HistoricalAcOutputData } from './services/liveDataService';
 
 const AZIMUTH_MAP: Record<string, number> = {
   'N': 0, 'NE': 45, 'E': 90, 'SE': 135, 'S': 180, 'SW': 225, 'W': 270, 'NW': 315
@@ -55,6 +55,36 @@ const migrateProfile = (profile: any): ZoneProfile => {
   return { ...profile, zone: { ...zone, walls: migratedWalls } };
 };
 
+// ── Default Zone 1 configuration (hardcoded baseline) ──────────────────────
+// 13 walls forming a closed polygon (SE=NW=11.86m, NE=SW=15.47m)
+// 4 external walls fixed: W1(SE 10.06m), W2(SW 7.01m), W6(NW 4.85m), W10(NE 4.26m)
+const DEFAULT_ZONE1: ZoneProfile = {
+  id: 'zone1-default',
+  zone: {
+    name: 'Zone 1',
+    ceilingHeightM: 2.7,
+    isTopFloor: false,
+    walls: [
+      { id: 'w1',  lengthM: 10.06, direction: 'SE', azimuth: 135, wallType: 'external', constructionType: 'opaque' },
+      { id: 'w2',  lengthM: 7.01,  direction: 'SW', azimuth: 225, wallType: 'external', constructionType: 'opaque' },
+      { id: 'w3',  lengthM: 2.62,  direction: 'NW', azimuth: 315, wallType: 'internal', constructionType: 'opaque' },
+      { id: 'w4',  lengthM: 3.04,  direction: 'SW', azimuth: 225, wallType: 'internal', constructionType: 'opaque' },
+      { id: 'w5',  lengthM: 5.42,  direction: 'SW', azimuth: 225, wallType: 'internal', constructionType: 'opaque' },
+      { id: 'w6',  lengthM: 4.85,  direction: 'NW', azimuth: 315, wallType: 'external', constructionType: 'opaque' },
+      { id: 'w7',  lengthM: 5.59,  direction: 'NE', azimuth: 45,  wallType: 'internal', constructionType: 'opaque' },
+      { id: 'w8',  lengthM: 3.70,  direction: 'NE', azimuth: 45,  wallType: 'internal', constructionType: 'opaque' },
+      { id: 'w9',  lengthM: 1.92,  direction: 'NE', azimuth: 45,  wallType: 'internal', constructionType: 'opaque' },
+      { id: 'w10', lengthM: 4.26,  direction: 'NE', azimuth: 45,  wallType: 'external', constructionType: 'opaque' },
+      { id: 'w11', lengthM: 1.70,  direction: 'NW', azimuth: 315, wallType: 'internal', constructionType: 'opaque' },
+      { id: 'w12', lengthM: 2.69,  direction: 'NW', azimuth: 315, wallType: 'internal', constructionType: 'opaque' },
+      { id: 'w13', lengthM: 1.80,  direction: 'SE', azimuth: 135, wallType: 'internal', constructionType: 'opaque' },
+    ],
+  },
+  ac: [
+    { id: '1', name: 'Split AC Main', ratedCapacityWatts: 6200, iseer: 3.7, ageYears: 2 },
+  ],
+};
+
 interface WallModal {
   isOpen: boolean;
   editingId: string | null;
@@ -84,18 +114,30 @@ function App() {
   const [configSection, setConfigSection] = useState<'zone' | 'ac'>('zone');
 
   const [zones, setZones] = useState<ZoneProfile[]>(() => {
-    const saved = localStorage.getItem('thermozone_data');
+    const saved = localStorage.getItem('thermozone_v2');
     if (saved) {
       try {
-        return JSON.parse(saved).map(migrateProfile);
+        const parsed = JSON.parse(saved).map(migrateProfile);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
       } catch (e) {
         console.error("Failed to parse saved data", e);
       }
     }
-    return [{ id: '1', zone: DEFAULT_ZONE, ac: DEFAULT_ACS }];
+    // Fall back to hardcoded default so Zone 1 always has the baseline config
+    return [DEFAULT_ZONE1];
   });
 
-  const [activeZoneId, setActiveZoneId] = useState<string>('1');
+  const [activeZoneId, setActiveZoneId] = useState<string>(() => {
+    // Restore the saved active zone id so edits/deletes always target the right zone
+    const saved = localStorage.getItem('thermozone_v2');
+    if (saved) {
+      try {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed[0].id;
+      } catch {}
+    }
+    return DEFAULT_ZONE1.id;
+  });
   const [selectedHour, setSelectedHour] = useState<number>(14);
   const [showDebug, setShowDebug] = useState<boolean>(false);
   const [weatherError, setWeatherError] = useState<string | null>(null);
@@ -112,15 +154,24 @@ function App() {
   const [isFetchingWeather, setIsFetchingWeather] = useState(false);
   const [locationInput, setLocationInput] = useState(location.name);
 
-  const activeProfile = zones.find(z => z.id === activeZoneId) ?? zones[0];
-  const { zone, ac: acList } = activeProfile;
+  const activeProfile = zones.find(z => z.id === activeZoneId) ?? zones[0] ?? null;
+  const zone = activeProfile?.zone ?? null;
+  const acList = activeProfile?.ac ?? [];
 
   const [results, setResults] = useState<SimulationResult | null>(null);
   const [liveData, setLiveData] = useState<LiveTempData | null>(null);
-  const [liveTempFallback, setLiveTempFallback] = useState(24.5);
+  const [historicalTemps, setHistoricalTemps] = useState<HistoricalTempData | null>(null);
+  const [historicalAcOutput, setHistoricalAcOutput] = useState<HistoricalAcOutputData | null>(null);
+
+  // Selected analysis date — defaults to today IST (YYYY-MM-DD)
+  const [selectedDate, setSelectedDate] = useState<string>(
+    () => new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' })
+  );
+  const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+  const isToday = selectedDate === todayIST;
 
   useEffect(() => {
-    localStorage.setItem('thermozone_data', JSON.stringify(zones));
+    localStorage.setItem('thermozone_v2', JSON.stringify(zones));
   }, [zones]);
 
   useEffect(() => {
@@ -128,7 +179,7 @@ function App() {
     const loadWeather = async () => {
       setIsFetchingWeather(true);
       setWeatherError(null);
-      const data = await fetchWeather(location.lat, location.lon);
+      const data = await fetchWeatherForDate(location.lat, location.lon, selectedDate);
       if (data) {
         setWeather(data);
       } else {
@@ -137,19 +188,35 @@ function App() {
       setIsFetchingWeather(false);
     };
     loadWeather();
-  }, [location]);
+  }, [location, selectedDate]);
 
   useEffect(() => {
-    if (!weather) return;
+    if (!weather || !zone) return;
     try {
-      const res = calculateHeatLoad(zone, acList, weather, location.lat, location.lon);
+      const realTemps = historicalTemps?.hasData ? historicalTemps.temps : null;
+      const realAcOutputs = historicalAcOutput?.hasData ? historicalAcOutput.acOutputs : null;
+      const res = calculateHeatLoad(zone, acList, weather, location.lat, location.lon, realTemps, realAcOutputs);
       setResults(res);
       setWeatherError(null);
     } catch (error) {
       console.error(error);
-      setWeatherError("Simulation failed. Please check your zone configuration.");
+      setWeatherError("Calculation failed. Please check your zone configuration.");
     }
-  }, [zone, acList, weather, location]);
+  }, [zone, acList, weather, location, historicalTemps, historicalAcOutput]);
+
+  // Fetch hourly real temps and real AC output from DB whenever zone or selected date changes
+  useEffect(() => {
+    if (!zone?.name) return;
+    const loadHistoricalData = async () => {
+      const [tempsData, acData] = await Promise.all([
+        fetchHistoricalTemps(zone.name, selectedDate),
+        fetchHistoricalAcOutput(zone.name, selectedDate),
+      ]);
+      setHistoricalTemps(tempsData);
+      setHistoricalAcOutput(acData);
+    };
+    loadHistoricalData();
+  }, [zone?.name, selectedDate]);
 
   const handleLocationSearch = async () => {
     if (!locationInput.trim()) return;
@@ -161,21 +228,19 @@ function App() {
   };
 
   useEffect(() => {
+    if (!zone?.name) return;
     const loadLiveTemp = async () => {
-      const data = await fetchLiveRoomTemp('Working Area 1');
-      if (data) {
-        setLiveData(data);
-      } else {
-        setLiveTempFallback(prev => Number((prev + (Math.random() - 0.5) * 0.2).toFixed(1)));
-      }
+      const data = await fetchLiveRoomTemp(zone.name);
+      setLiveData(data);
     };
     loadLiveTemp();
     const interval = setInterval(loadLiveTemp, 5 * 60 * 1000);
     return () => clearInterval(interval);
-  }, []);
+  }, [zone?.name]);
 
   const updateActiveProfile = (updates: Partial<ZoneProfile>) => {
-    setZones(prev => prev.map(z => z.id === activeZoneId ? { ...z, ...updates } : z));
+    const targetId = activeZoneId || zones[0]?.id;
+    setZones(prev => prev.map(z => z.id === targetId ? { ...z, ...updates } : z));
   };
 
   const addNewZone = () => {
@@ -187,6 +252,7 @@ function App() {
     };
     setZones(prev => [...prev, newProfile]);
     setActiveZoneId(newId);
+    setActiveTab('configure'); // go straight to config so user can set up the zone
   };
 
   // --- Wall Modal Handlers ---
@@ -263,7 +329,7 @@ function App() {
 
   // --- Wall display helpers ---
   const getWallSummary = (wall: WallDef) => {
-    const faceArea = wall.lengthM * zone.ceilingHeightM;
+    const faceArea = wall.lengthM * (zone?.ceilingHeightM ?? 2.7);
     if (wall.constructionType === 'full_glass') return { faceArea, glassArea: faceArea, solidArea: 0 };
     if (wall.constructionType === 'mixed') {
       if (wall.wallType === 'external') {
@@ -291,7 +357,7 @@ function App() {
   };
 
   // --- Modal derived values ---
-  const modalFaceArea = wallModal.lengthM * zone.ceilingHeightM;
+  const modalFaceArea = wallModal.lengthM * (zone?.ceilingHeightM ?? 2.7);
   const modalGlassArea = (() => {
     if (wallModal.constructionType === 'full_glass') return modalFaceArea;
     if (wallModal.constructionType === 'mixed') {
@@ -555,6 +621,21 @@ function App() {
 
       <main className="max-w-7xl mx-auto px-4 mt-8">
 
+        {/* ── Empty state — no zones yet ── */}
+        {zones.length === 0 && (
+          <div className="flex flex-col items-center justify-center py-32 text-center gap-6">
+            <div className="p-5 bg-slate-800 rounded-full">
+              <LayoutGrid className="text-blue-400" size={40} />
+            </div>
+            <div>
+              <h2 className="text-xl font-bold text-white mb-2">No zones configured</h2>
+              <p className="text-slate-400 text-sm">Click the <span className="text-blue-400 font-semibold">+</span> button in the header to add your first zone.</p>
+            </div>
+          </div>
+        )}
+
+        {zones.length > 0 && (<>
+
         {weatherError && (
           <div className="mb-6 p-4 bg-red-900/30 border border-red-700 rounded-xl text-red-300 text-sm">
             {weatherError}
@@ -573,67 +654,17 @@ function App() {
                 <p className="text-xs text-slate-400 uppercase tracking-wider">
                   Zone Temp
                   {liveData && <span className="ml-2 text-green-400 normal-case font-normal">● Live</span>}
-                  {!liveData && <span className="ml-2 text-yellow-500 normal-case font-normal">⚠ Simulated</span>}
+                  {!liveData && <span className="ml-2 text-slate-500 normal-case font-normal">No sensor data</span>}
+                  {historicalTemps?.hasData && <span className="ml-2 text-blue-400 normal-case font-normal">· DB temps active</span>}
+                  {historicalAcOutput?.hasData && <span className="ml-2 text-purple-400 normal-case font-normal">· DB AC active</span>}
                 </p>
                 <p className="text-2xl font-mono font-bold text-white">
-                  {liveData ? liveData.avgTemp.toFixed(1) : liveTempFallback}°C
+                  {liveData ? `${liveData.avgTemp.toFixed(1)}°C` : '—'}
                 </p>
               </div>
             </div>
 
-            <div className="h-10 w-px bg-slate-800 hidden sm:block"></div>
 
-            {liveData && (
-              <>
-                <div className="flex items-center gap-3">
-                  <div className="p-2 bg-slate-800 rounded-full">
-                    <Server className="text-blue-400" size={20} />
-                  </div>
-                  <div>
-                    <p className="text-xs text-slate-400 uppercase tracking-wider">Sensors</p>
-                    <p className="text-lg font-mono font-bold text-white">{liveData.sensorCount} active</p>
-                  </div>
-                </div>
-
-                <div className="h-10 w-px bg-slate-800 hidden sm:block"></div>
-
-                <div className="flex flex-wrap gap-2">
-                  {liveData.sensors.map((s) => (
-                    <div
-                      key={s.name}
-                      className="px-3 py-2 bg-slate-800 rounded-lg border border-slate-700 flex flex-col items-center min-w-[80px]"
-                      title={`Last seen: ${new Date(s.deviceTimestamp).toLocaleTimeString()}`}
-                    >
-                      <span className="text-[10px] text-slate-500 uppercase tracking-tight truncate max-w-[80px]">{s.name}</span>
-                      <span className="text-sm font-mono font-bold text-white">{s.temp.toFixed(1)}°C</span>
-                      {s.setpoint != null && <span className="text-[10px] text-blue-400 font-mono">SP {s.setpoint.toFixed(1)}°C</span>}
-                      {s.mode && <span className="text-[9px] text-slate-400 capitalize">{s.mode.toLowerCase()}</span>}
-                      {s.powerStatus && (
-                        <span className={`text-[9px] font-semibold ${s.powerStatus.toLowerCase() === 'on' ? 'text-green-400' : 'text-red-400'}`}>
-                          {s.powerStatus.toUpperCase()}
-                        </span>
-                      )}
-                      {s.status === 'offline' && <span className="text-[9px] text-yellow-500">offline</span>}
-                    </div>
-                  ))}
-                </div>
-              </>
-            )}
-
-            {!liveData && (
-              <>
-                <div className="h-10 w-px bg-slate-800 hidden sm:block"></div>
-                <div className="flex items-center gap-3">
-                  <div className="p-2 bg-slate-800 rounded-full">
-                    <Wind className="text-blue-400" size={24} />
-                  </div>
-                  <div>
-                    <p className="text-xs text-slate-400 uppercase tracking-wider">System</p>
-                    <p className="text-lg font-medium text-green-400">Active</p>
-                  </div>
-                </div>
-              </>
-            )}
           </div>
 
           {liveData && (
@@ -836,6 +867,31 @@ function App() {
         {/* ── MONITOR TAB ── */}
         {activeTab === 'monitor' && (
           <div className="space-y-8 animate-fade-in">
+            {/* Date picker */}
+            <div className="flex items-center gap-3 px-1">
+              <label className="text-xs font-medium uppercase tracking-wider text-slate-400">Analysis Date</label>
+              <input
+                type="date"
+                value={selectedDate}
+                max={todayIST}
+                onChange={e => setSelectedDate(e.target.value)}
+                className="bg-slate-800 border border-slate-600 text-white text-sm rounded-lg px-3 py-1.5 focus:outline-none focus:border-blue-500 cursor-pointer"
+              />
+              {!isToday && (
+                <button
+                  onClick={() => setSelectedDate(todayIST)}
+                  className="text-xs text-blue-400 hover:text-blue-300 border border-blue-800 hover:border-blue-600 px-2 py-1 rounded-lg transition-colors"
+                >
+                  Back to Today
+                </button>
+              )}
+              {!isToday && (
+                <span className="text-xs text-orange-400 font-medium">
+                  📅 Viewing historical: {selectedDate}
+                </span>
+              )}
+            </div>
+
             {results && (
               <>
                 <ResultsDashboard
@@ -843,6 +899,7 @@ function App() {
                   ratedCapacityWatts={totalAcCapacityWatts}
                   locationName={location.name}
                   walls={zone.walls}
+                  isToday={isToday}
                 />
 
                 <div className="flex justify-center">
@@ -892,6 +949,8 @@ function App() {
             )}
           </div>
         )}
+
+        </>)}
       </main>
     </div>
   );

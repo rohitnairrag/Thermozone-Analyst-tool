@@ -62,12 +62,21 @@ interface Props {
   ratedCapacityWatts: number;
   locationName?: string;
   walls?: WallDef[];
+  isToday?: boolean;
 }
 
-const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locationName, walls = [] }) => {
+const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locationName, walls = [], isToday = true }) => {
   const peakLoadTR = (results.peakLoadWatts / 3517).toFixed(2);
-  const acCapacityTR = (ratedCapacityWatts / 3517).toFixed(2);
-  const chartData = results.data;
+  const acOutputTR = (results.acOutputAtPeakLoad / 3517).toFixed(2);
+
+  // Current IST hour — chart only shows hours 0 … currentISTHour (no future data) when isToday
+  const currentISTHour = new Date(
+    new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })
+  ).getHours();
+
+  // Slice simulation data: today → up to current IST hour; historical → full 24h
+  const chartData = isToday ? results.data.slice(0, currentISTHour + 1) : results.data;
+  const timeRangeLabel = isToday ? `0:00 → ${currentISTHour}:00 IST` : `Full Day (0:00 – 23:00)`;
 
   const processedData: ProcessedDataPoint[] = chartData.map(d => ({
     ...d,
@@ -110,7 +119,7 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
           <p className={`text-2xl font-bold ${results.isSufficient ? 'text-green-400' : 'text-red-400'}`}>
             {results.isSufficient ? 'SUFFICIENT' : 'UNDERSIZED'}
           </p>
-          <p className="text-xs text-gray-400 mt-1">AC Capacity vs Peak Load</p>
+          <p className="text-xs text-gray-400 mt-1">Actual AC Output vs Peak Load</p>
         </div>
 
         <div className="p-4 bg-slate-800 rounded-xl border border-slate-700">
@@ -124,11 +133,11 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
 
         <div className="p-4 bg-slate-800 rounded-xl border border-slate-700">
           <div className="flex items-center justify-between mb-2">
-            <h3 className="text-sm font-medium text-gray-300">Total AC Capacity</h3>
-            <CloudSun className="text-blue-400" size={20} />
+            <h3 className="text-sm font-medium text-gray-300">AC Output at Peak</h3>
+            <Zap className="text-blue-400" size={20} />
           </div>
-          <p className="text-2xl font-bold text-white">{acCapacityTR} <span className="text-sm font-normal text-gray-400">TR</span></p>
-          <p className="text-xs text-gray-400 mt-1">Rated @ {ratedCapacityWatts}W</p>
+          <p className="text-2xl font-bold text-white">{acOutputTR} <span className="text-sm font-normal text-gray-400">TR</span></p>
+          <p className="text-xs text-gray-400 mt-1">At peak hour · {Math.round(results.acOutputAtPeakLoad)} W</p>
         </div>
 
       </div>
@@ -138,7 +147,12 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
 
         {/* Load Profile Chart */}
         <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
-          <h3 className="text-lg font-semibold text-white mb-6">Total Heat Load vs Time</h3>
+          <div className="flex items-center justify-between mb-6">
+            <h3 className="text-lg font-semibold text-white">Total Heat Load vs Time</h3>
+            <span className="text-xs text-slate-400 font-mono bg-slate-700 px-2 py-1 rounded">
+              {timeRangeLabel}
+            </span>
+          </div>
           <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
@@ -149,7 +163,7 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
                   </linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                <XAxis dataKey="time" stroke="#94a3b8" fontSize={12} interval={3} />
+                <XAxis dataKey="time" stroke="#94a3b8" fontSize={12} interval={Math.max(1, Math.floor(chartData.length / 6))} />
                 <YAxis
                   stroke="#94a3b8"
                   fontSize={12}
@@ -173,12 +187,17 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
 
         {/* Load Breakdown Chart */}
         <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
-          <h3 className="text-lg font-semibold text-white mb-6">Stacked Heat Load Components</h3>
+          <div className="flex items-center justify-between mb-6">
+            <h3 className="text-lg font-semibold text-white">Stacked Heat Load Components</h3>
+            <span className="text-xs text-slate-400 font-mono bg-slate-700 px-2 py-1 rounded">
+              {timeRangeLabel}
+            </span>
+          </div>
           <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={processedData} margin={{ top: 20, right: 20, left: 10, bottom: 20 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                <XAxis dataKey="time" stroke="#94a3b8" fontSize={12} interval={3} />
+                <XAxis dataKey="time" stroke="#94a3b8" fontSize={12} interval={Math.max(1, Math.floor(processedData.length / 6))} />
                 <YAxis stroke="#94a3b8" fontSize={12} width={45} label={{ value: 'Watts', angle: -90, position: 'insideLeft', fill: '#94a3b8', offset: 0 }} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend wrapperStyle={{ paddingTop: '10px' }} />

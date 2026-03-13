@@ -6,13 +6,17 @@ export const calculateHeatLoad = (
   acList: ACUnit[],
   weather: HourlyWeather | null = null,
   lat: number = 12.9716,
-  lon: number = 77.5946
+  lon: number = 77.5946,
+  realIndoorTemps: number[] | null = null,        // 24-element array from DB (index = hour); overrides simulated indoor temp
+  realAcOutputsWatts: number[] | null = null      // 24-element array from DB (index = hour); total zone AC electrical watts
 ): SimulationResult => {
   if (!weather || !weather.temperature) {
     throw new Error("Weather data missing from API.");
   }
 
   const totalRatedCapacity = acList.reduce((sum, ac) => sum + ac.ratedCapacityWatts, 0);
+  // Weighted-average ISEER across all ACs — used to convert real electrical input → cooling output
+  const avgISEER = acList.length > 0 ? acList.reduce((s, ac) => s + ac.iseer, 0) / acList.length : 3.5;
 
   const areaM2 = computeFloorArea(zone.walls);
   const roomVolumeM3 = areaM2 * zone.ceilingHeightM;
@@ -92,12 +96,14 @@ export const calculateHeatLoad = (
   const solarHistory: number[] = [];
   const data: SimulationDataPoint[] = [];
 
-  let currentIndoorTemp = 24.0;
+  // Use the first real reading as starting temp if available, else default to 24°C
+  let currentIndoorTemp = (realIndoorTemps && realIndoorTemps[0] != null) ? realIndoorTemps[0] : 24.0;
   let totalTempSum = 0;
   let maxTemp = 0;
   let peakLoadWatts = 0;
   let peakLoadTime = '';
   let peakPerformanceFactor = 1;
+  let acOutputAtPeakLoad = 0;   // actual AC output (watts) at the hour peak load occurs
 
   const roomThermalMassJperK = areaM2 * 50000;
   const thermalMassWatts = roomThermalMassJperK / 3600;
@@ -250,30 +256,41 @@ export const calculateHeatLoad = (
     const maxAvailableCapacity = acActive ? (totalRatedCapacity * performanceFactor) : 0;
 
     // Thermal Simulation
-    let targetTemp = stepSetPoint + 0.2;
-    if (acActive) {
-      const loadStress = maxAvailableCapacity > 0 ? (currentTotalLoad / maxAvailableCapacity) : 1;
-      targetTemp += Math.min(1.8, loadStress * 2.0);
+    // If real measured temps are available, use them directly for this hour.
+    // Otherwise fall back to the physics model estimate.
+    let nextTemp: number;
+    if (realIndoorTemps && realIndoorTemps[hour] != null) {
+      nextTemp = realIndoorTemps[hour];
     } else {
-      targetTemp = currentIndoorTemp + (outdoorTemp - currentIndoorTemp) * 0.15;
-    }
-
-    let nextTemp = (currentIndoorTemp * 0.70) + (targetTemp * 0.30);
-    if (acActive) {
-      if (nextTemp < 22.5) nextTemp = 22.5;
-      if (nextTemp > 25.8) nextTemp = 25.8;
-    } else {
-      if (nextTemp < 21) nextTemp = 21;
-      if (nextTemp > 28) nextTemp = 28;
+      let targetTemp = stepSetPoint + 0.2;
+      if (acActive) {
+        const loadStress = maxAvailableCapacity > 0 ? (currentTotalLoad / maxAvailableCapacity) : 1;
+        targetTemp += Math.min(1.8, loadStress * 2.0);
+      } else {
+        targetTemp = currentIndoorTemp + (outdoorTemp - currentIndoorTemp) * 0.15;
+      }
+      nextTemp = (currentIndoorTemp * 0.70) + (targetTemp * 0.30);
+      if (acActive) {
+        if (nextTemp < 22.5) nextTemp = 22.5;
+        if (nextTemp > 25.8) nextTemp = 25.8;
+      } else {
+        if (nextTemp < 21) nextTemp = 21;
+        if (nextTemp > 28) nextTemp = 28;
+      }
     }
 
     const tempChange = currentIndoorTemp - nextTemp;
-    let sensibleWork = currentTotalLoad + (tempChange * thermalMassWatts * 3.0);
-    let acOutputEst = sensibleWork > 0 ? sensibleWork * LATENT_HEAT_FACTOR : sensibleWork;
-
-    if (!acActive) acOutputEst = 0;
-    if (acOutputEst > maxAvailableCapacity) acOutputEst = maxAvailableCapacity;
-    if (acOutputEst < 0) acOutputEst = 0;
+    let acOutputEst: number;
+    if (realAcOutputsWatts && realAcOutputsWatts[hour] != null) {
+      // Real DB data: electrical watts × avgISEER = actual cooling watts delivered
+      acOutputEst = realAcOutputsWatts[hour] * avgISEER;
+    } else {
+      let sensibleWork = currentTotalLoad + (tempChange * thermalMassWatts * 3.0);
+      acOutputEst = sensibleWork > 0 ? sensibleWork * LATENT_HEAT_FACTOR : sensibleWork;
+      if (!acActive) acOutputEst = 0;
+      if (acOutputEst > maxAvailableCapacity) acOutputEst = maxAvailableCapacity;
+      if (acOutputEst < 0) acOutputEst = 0;
+    }
 
     currentIndoorTemp = nextTemp;
     totalTempSum += nextTemp;
@@ -283,6 +300,7 @@ export const calculateHeatLoad = (
       peakLoadWatts = currentTotalLoad;
       peakLoadTime = `${hour}:00`;
       peakPerformanceFactor = performanceFactor;
+      acOutputAtPeakLoad = acOutputEst;
     }
 
     data.push({
@@ -313,8 +331,11 @@ export const calculateHeatLoad = (
     });
   }
 
-  // Compare peak load against derated capacity at peak hour
-  const isSufficient = (totalRatedCapacity * peakPerformanceFactor) >= peakLoadWatts;
+  // Verdict: if real AC output data is available, compare actual output at peak load hour
+  // against the peak load. Otherwise fall back to rated capacity × derating factor.
+  const isSufficient = realAcOutputsWatts
+    ? acOutputAtPeakLoad >= peakLoadWatts
+    : (totalRatedCapacity * peakPerformanceFactor) >= peakLoadWatts;
 
   return {
     data,
@@ -322,6 +343,7 @@ export const calculateHeatLoad = (
     peakLoadTime,
     isSufficient,
     averageTemp: totalTempSum / 24,
-    maxTemp
+    maxTemp,
+    acOutputAtPeakLoad,
   };
 };

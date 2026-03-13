@@ -100,4 +100,5 @@ export interface SimulationResult {
   isSufficient: boolean;
   averageTemp: number;
   maxTemp: number;
+  acOutputAtPeakLoad: number;   // actual AC output (W) at the hour peak load occurs
 }
