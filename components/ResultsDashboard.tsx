@@ -69,14 +69,17 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
   const peakLoadTR = (results.peakLoadWatts / 3517).toFixed(2);
   const acOutputTR = (results.acOutputAtPeakLoad / 3517).toFixed(2);
 
-  // Current IST hour — chart only shows hours 0 … currentISTHour (no future data) when isToday
-  const currentISTHour = new Date(
-    new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' })
-  ).getHours();
+  // Current IST time — chart shows slots 0 … currentSlot (no future data) when isToday
+  // Simulation now runs at 30-min resolution: slot = hour*2 + (min>=30 ? 1 : 0)
+  const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  const currentISTHour   = nowIST.getHours();
+  const currentISTMinute = nowIST.getMinutes();
+  const currentSlot = currentISTHour * 2 + (currentISTMinute >= 30 ? 1 : 0);
 
-  // Slice simulation data: today → up to current IST hour; historical → full 24h
-  const chartData = isToday ? results.data.slice(0, currentISTHour + 1) : results.data;
-  const timeRangeLabel = isToday ? `0:00 → ${currentISTHour}:00 IST` : `Full Day (0:00 – 23:00)`;
+  // Slice simulation data: today → up to current IST 30-min slot; historical → full 48 slots
+  const chartData = isToday ? results.data.slice(0, currentSlot + 1) : results.data;
+  const nowLabel  = `${currentISTHour.toString().padStart(2, '0')}:${currentISTMinute >= 30 ? '30' : '00'}`;
+  const timeRangeLabel = isToday ? `00:00 → ${nowLabel} IST` : `Full Day (00:00 – 23:30)`;
 
   const processedData: ProcessedDataPoint[] = chartData.map(d => ({
     ...d,
@@ -163,7 +166,7 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
                   </linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                <XAxis dataKey="time" stroke="#94a3b8" fontSize={12} interval={Math.max(1, Math.floor(chartData.length / 6))} />
+                <XAxis dataKey="time" stroke="#94a3b8" fontSize={11} interval={Math.max(1, Math.floor(chartData.length / 8))} />
                 <YAxis
                   stroke="#94a3b8"
                   fontSize={12}
@@ -197,7 +200,7 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
             <ResponsiveContainer width="100%" height="100%">
               <AreaChart data={processedData} margin={{ top: 20, right: 20, left: 10, bottom: 20 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-                <XAxis dataKey="time" stroke="#94a3b8" fontSize={12} interval={Math.max(1, Math.floor(processedData.length / 6))} />
+                <XAxis dataKey="time" stroke="#94a3b8" fontSize={11} interval={Math.max(1, Math.floor(processedData.length / 8))} />
                 <YAxis stroke="#94a3b8" fontSize={12} width={45} label={{ value: 'Watts', angle: -90, position: 'insideLeft', fill: '#94a3b8', offset: 0 }} />
                 <Tooltip content={<CustomTooltip />} />
                 <Legend wrapperStyle={{ paddingTop: '10px' }} />
@@ -313,15 +316,16 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
           const activeHours = chartData.filter(d => !(d.totalHeatLoad === 0 && d.acOutputWatts === 0));
           const sufficientCount = activeHours.filter(d => d.acOutputWatts >= d.totalHeatLoad).length;
           const undersizedCount = activeHours.length - sufficientCount;
-          return activeHours.length > 0 ? (
-            <div className="mt-3 pt-3 border-t border-slate-700 flex gap-6 text-xs text-slate-400">
-              <span>Active hours: <span className="text-white font-semibold">{activeHours.length}</span></span>
-              <span className="text-green-400">✓ Sufficient: <span className="font-semibold">{sufficientCount}h</span></span>
-              <span className="text-red-400">✗ Undersized: <span className="font-semibold">{undersizedCount}h</span></span>
+          const totalSlots = activeHours.length;
+          return totalSlots > 0 ? (
+            <div className="mt-3 pt-3 border-t border-slate-700 flex flex-wrap gap-6 text-xs text-slate-400">
+              <span>Active 30-min slots: <span className="text-white font-semibold">{totalSlots}</span> ({(totalSlots / 2).toFixed(1)} h)</span>
+              <span className="text-green-400">✓ Sufficient: <span className="font-semibold">{sufficientCount}</span> slots ({(sufficientCount / 2).toFixed(1)} h)</span>
+              <span className="text-red-400">✗ Undersized: <span className="font-semibold">{undersizedCount}</span> slots ({(undersizedCount / 2).toFixed(1)} h)</span>
               <span>
                 Efficiency score:{' '}
                 <span className="font-semibold text-white">
-                  {((sufficientCount / activeHours.length) * 100).toFixed(0)}%
+                  {((sufficientCount / totalSlots) * 100).toFixed(0)}%
                 </span>
               </span>
             </div>
@@ -336,7 +340,7 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
               <CartesianGrid strokeDasharray="3 3" stroke="#334155" />
-              <XAxis dataKey="time" stroke="#94a3b8" fontSize={12} interval={3} />
+              <XAxis dataKey="time" stroke="#94a3b8" fontSize={11} interval={Math.max(1, Math.floor(chartData.length / 8))} />
               <YAxis stroke="#94a3b8" fontSize={12} label={{ value: 'Watts', angle: -90, position: 'insideLeft', fill: '#94a3b8' }} />
               <Tooltip content={<CustomTooltip />} />
               <Legend />
