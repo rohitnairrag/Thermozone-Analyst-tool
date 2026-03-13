@@ -1,5 +1,6 @@
-import { ZoneParams, ACUnit, SimulationResult, SimulationDataPoint, HourlyWeather } from '../types';
+import { ZoneParams, ACUnit, SimulationResult, SimulationDataPoint, HourlyWeather, InternalLoadItem } from '../types';
 import { computeFloorArea } from './geometry';
+import { computeScheduledInternalLoads } from './internalLoadScheduler';
 
 export const calculateHeatLoad = (
   zone: ZoneParams,
@@ -8,7 +9,8 @@ export const calculateHeatLoad = (
   lat: number = 12.9716,
   lon: number = 77.5946,
   realIndoorTemps: number[] | null = null,        // 24-element array from DB (index = hour); overrides simulated indoor temp
-  realAcOutputsWatts: number[] | null = null      // 24-element array from DB (index = hour); total zone AC electrical watts
+  realAcOutputsWatts: number[] | null = null,     // 24-element array from DB (index = hour); total zone AC electrical watts
+  internalLoadItems?: InternalLoadItem[]          // optional per-unit inventory; replaces W/m² density method when provided
 ): SimulationResult => {
   if (!weather || !weather.temperature) {
     throw new Error("Weather data missing from API.");
@@ -151,10 +153,21 @@ export const calculateHeatLoad = (
     inf += Math.max(0, qInf);
 
     // 2. Internal Gains
-    const nPeople = maxPeople * getOccupancyFactor(hour);
-    people += nPeople * PEOPLE_TOTAL_HEAT;
-    internalEquipment += LIGHTING_DENSITY * areaM2 * getLightingFactor(hour);
-    internalEquipment += EQUIPMENT_DENSITY * areaM2 * getEquipmentFactor(hour);
+    // Use inventory-based scheduled loads when an item list is provided;
+    // otherwise fall back to the generic W/m² density estimates.
+    if (internalLoadItems && internalLoadItems.length > 0) {
+      // ── Inventory / scheduled approach ────────────────────────────────────
+      // Each item contributes: count × wattsPerUnit × schedulePreset(hour)
+      const sched = computeScheduledInternalLoads(internalLoadItems, hour);
+      people           += sched.people;
+      internalEquipment += sched.lighting + sched.equipment + sched.appliance;
+    } else {
+      // ── Density-based fallback (generic W/m²) ────────────────────────────
+      const nPeople = maxPeople * getOccupancyFactor(hour);
+      people           += nPeople * PEOPLE_TOTAL_HEAT;
+      internalEquipment += LIGHTING_DENSITY * areaM2 * getLightingFactor(hour);
+      internalEquipment += EQUIPMENT_DENSITY * areaM2 * getEquipmentFactor(hour);
+    }
 
     // 3. Roof (Top Floor only)
     if (zone.isTopFloor) {

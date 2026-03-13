@@ -6,7 +6,7 @@ import ResultsDashboard from './components/ResultsDashboard';
 import DebugPanel from './components/DebugPanel';
 import {
   SimulationResult, ACUnit, ZoneProfile, WallDef, Direction,
-  LocationData, HourlyWeather, ConstructionType, EmbeddedWindow
+  LocationData, HourlyWeather, ConstructionType, EmbeddedWindow, InternalLoadItem
 } from './types';
 import { searchLocation, fetchWeather, fetchWeatherForDate } from './services/weatherService';
 import { fetchLiveRoomTemp, fetchHistoricalTemps, fetchHistoricalAcOutput, LiveTempData, HistoricalTempData, HistoricalAcOutputData } from './services/liveDataService';
@@ -83,6 +83,17 @@ const DEFAULT_ZONE1: ZoneProfile = {
   ac: [
     { id: '1', name: 'Split AC Main', ratedCapacityWatts: 6200, iseer: 3.7, ageYears: 2 },
   ],
+  // Actual Zone 1 inventory (Working Area 1 + Working Area 2 + Embedded Team)
+  // Source: physical audit — use scheduled internal load method instead of W/m² density.
+  internalLoads: [
+    { id: 'il-people',        label: 'People',        category: 'people',    count: 5,  wattsPerUnit: 130, schedulePreset: 'office_occupancy' },
+    { id: 'il-monitors',      label: 'Monitors',      category: 'equipment', count: 7,  wattsPerUnit: 30,  schedulePreset: 'office_equipment'  },
+    { id: 'il-printer',       label: 'Printer',       category: 'equipment', count: 1,  wattsPerUnit: 500, schedulePreset: 'intermittent'       },
+    { id: 'il-tube-lights',   label: 'Tube Lights',   category: 'lighting',  count: 19, wattsPerUnit: 40,  schedulePreset: 'office_lighting'    },
+    { id: 'il-fridge',        label: 'Fridge',        category: 'appliance', count: 1,  wattsPerUnit: 200, schedulePreset: 'always_on'          },
+    { id: 'il-fans',          label: 'Fans',          category: 'equipment', count: 3,  wattsPerUnit: 75,  schedulePreset: 'office_occupancy'   },
+    { id: 'il-ceiling-lights',label: 'Ceiling Lights',category: 'lighting',  count: 9,  wattsPerUnit: 15,  schedulePreset: 'office_lighting'    },
+  ] as InternalLoadItem[],
 };
 
 interface WallModal {
@@ -195,14 +206,15 @@ function App() {
     try {
       const realTemps = historicalTemps?.hasData ? historicalTemps.temps : null;
       const realAcOutputs = historicalAcOutput?.hasData ? historicalAcOutput.acOutputs : null;
-      const res = calculateHeatLoad(zone, acList, weather, location.lat, location.lon, realTemps, realAcOutputs);
+      const inventoryItems = activeProfile?.internalLoads;
+      const res = calculateHeatLoad(zone, acList, weather, location.lat, location.lon, realTemps, realAcOutputs, inventoryItems);
       setResults(res);
       setWeatherError(null);
     } catch (error) {
       console.error(error);
       setWeatherError("Calculation failed. Please check your zone configuration.");
     }
-  }, [zone, acList, weather, location, historicalTemps, historicalAcOutput]);
+  }, [zone, acList, weather, location, historicalTemps, historicalAcOutput, activeProfile?.internalLoads]);
 
   // Fetch hourly real temps and real AC output from DB whenever zone or selected date changes
   useEffect(() => {
