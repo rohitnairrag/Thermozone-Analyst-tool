@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Activity, Thermometer, Wind, Server, Plus, Trash2, Map, Clock, LayoutGrid, Bug, Pencil, X } from 'lucide-react';
+import { Activity, Thermometer, Wind, Server, Plus, Trash2, Map, Clock, LayoutGrid, Bug, Pencil, X, Flame } from 'lucide-react';
 import { DEFAULT_ACS, DEFAULT_ZONE } from './constants';
 import { calculateHeatLoad } from './services/physicsEngine';
 import ResultsDashboard from './components/ResultsDashboard';
@@ -122,7 +122,7 @@ const DEFAULT_WALL_MODAL: WallModal = {
 
 function App() {
   const [activeTab, setActiveTab] = useState<'monitor' | 'configure'>('monitor');
-  const [configSection, setConfigSection] = useState<'zone' | 'ac'>('zone');
+  const [configSection, setConfigSection] = useState<'zone' | 'ac' | 'internal'>('zone');
 
   const [zones, setZones] = useState<ZoneProfile[]>(() => {
     const saved = localStorage.getItem('thermozone_v2');
@@ -338,6 +338,33 @@ function App() {
   };
 
   const totalAcCapacityWatts = acList.reduce((s, a) => s + a.ratedCapacityWatts, 0);
+
+  // --- Internal Load Handlers ---
+  const internalLoadItems: InternalLoadItem[] = activeProfile?.internalLoads ?? [];
+
+  const addInternalLoadItem = () => {
+    const newItem: InternalLoadItem = {
+      id: Date.now().toString(),
+      label: 'New Item',
+      category: 'equipment',
+      count: 1,
+      wattsPerUnit: 100,
+      schedulePreset: 'office_equipment',
+    };
+    updateActiveProfile({ internalLoads: [...internalLoadItems, newItem] });
+  };
+
+  const updateInternalLoadItem = (id: string, field: keyof InternalLoadItem, value: string | number) => {
+    updateActiveProfile({
+      internalLoads: internalLoadItems.map(item =>
+        item.id === id ? { ...item, [field]: value } : item
+      ),
+    });
+  };
+
+  const removeInternalLoadItem = (id: string) => {
+    updateActiveProfile({ internalLoads: internalLoadItems.filter(item => item.id !== id) });
+  };
 
   // --- Wall display helpers ---
   const getWallSummary = (wall: WallDef) => {
@@ -692,12 +719,13 @@ function App() {
           <div className="grid grid-cols-1 lg:grid-cols-4 gap-8 animate-fade-in">
             <div className="lg:col-span-1 space-y-2">
               {[
-                { id: 'zone', label: 'Zone Metadata', icon: Server },
-                { id: 'ac',   label: 'AC Specification', icon: Wind },
+                { id: 'zone',     label: 'Zone Metadata',    icon: Server },
+                { id: 'ac',       label: 'AC Specification', icon: Wind   },
+                { id: 'internal', label: 'Internal Loads',   icon: Flame  },
               ].map((item) => (
                 <button
                   key={item.id}
-                  onClick={() => setConfigSection(item.id as 'zone' | 'ac')}
+                  onClick={() => setConfigSection(item.id as 'zone' | 'ac' | 'internal')}
                   className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-all ${configSection === item.id ? 'bg-slate-800 border border-slate-700 text-white' : 'text-slate-400 hover:bg-slate-900'}`}
                 >
                   <item.icon size={18} className={configSection === item.id ? 'text-blue-500' : 'text-slate-500'} />
@@ -872,6 +900,173 @@ function App() {
                   </div>
                 </div>
               )}
+
+              {/* ── INTERNAL LOADS SECTION ── */}
+              {configSection === 'internal' && (() => {
+                const SCHEDULE_LABELS: Record<string, string> = {
+                  office_occupancy: 'Occupancy (8–18)',
+                  office_lighting:  'Lighting (8–18)',
+                  office_equipment: 'Equipment (9–17)',
+                  always_on:        'Always On (24/7 · 60%)',
+                  intermittent:     'Intermittent (30%)',
+                };
+                const CATEGORY_COLORS: Record<string, string> = {
+                  people:    'bg-orange-500/10 text-orange-400 border-orange-500/20',
+                  lighting:  'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',
+                  equipment: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
+                  appliance: 'bg-purple-500/10 text-purple-400 border-purple-500/20',
+                };
+                const peakRatedW = internalLoadItems.reduce((s, i) => s + i.count * i.wattsPerUnit, 0);
+                const selectCls = "bg-slate-900 border border-slate-700 rounded-lg py-1.5 px-2 text-white text-xs focus:ring-2 focus:ring-blue-500 outline-none w-full";
+                return (
+                  <div className="space-y-6">
+                    {/* Header */}
+                    <div className="flex items-start justify-between gap-4">
+                      <div>
+                        <h3 className="font-semibold text-white flex items-center gap-2">
+                          <Flame size={16} className="text-orange-400" /> Internal Heat Sources
+                        </h3>
+                        <p className="text-xs text-slate-500 mt-1">
+                          Each item is multiplied by its schedule factor every hour.
+                          Heat is split into <span className="text-green-400">people</span>,{' '}
+                          <span className="text-yellow-400">lighting</span>,{' '}
+                          <span className="text-blue-400">equipment</span> &amp;{' '}
+                          <span className="text-purple-400">appliance</span> categories.
+                        </p>
+                      </div>
+                      <button
+                        onClick={addInternalLoadItem}
+                        className="flex items-center gap-1 text-xs bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-lg shrink-0 transition-colors"
+                      >
+                        <Plus size={13} /> Add Item
+                      </button>
+                    </div>
+
+                    {/* Method badge */}
+                    <div className="flex items-center gap-2 px-3 py-2 bg-green-900/20 border border-green-800/40 rounded-lg text-xs text-green-400">
+                      <Activity size={13} />
+                      {internalLoadItems.length > 0
+                        ? 'Using inventory-based scheduled method — overrides generic W/m² density estimate'
+                        : 'No inventory — falling back to generic W/m² density estimate'}
+                    </div>
+
+                    {/* Item list */}
+                    {internalLoadItems.length === 0 ? (
+                      <div className="py-12 border-2 border-dashed border-slate-800 rounded-2xl flex flex-col items-center justify-center text-slate-500 gap-3">
+                        <Flame size={36} className="opacity-20" />
+                        <p className="text-sm">No internal load items defined.</p>
+                        <button onClick={addInternalLoadItem} className="text-blue-400 hover:text-blue-300 text-sm font-medium">Click to add your first item</button>
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {/* Column headers */}
+                        <div className="hidden md:grid grid-cols-[1fr_110px_80px_80px_1fr_60px_28px] gap-3 px-4 text-[10px] text-slate-500 uppercase font-bold tracking-widest">
+                          <span>Label</span><span>Category</span><span>Count</span><span>W/unit</span><span>Schedule</span><span className="text-right">Peak W</span><span />
+                        </div>
+
+                        {internalLoadItems.map((item) => (
+                          <div key={item.id} className="bg-slate-950/50 border border-slate-800 rounded-xl p-3 grid grid-cols-1 md:grid-cols-[1fr_110px_80px_80px_1fr_60px_28px] gap-3 items-center hover:border-slate-700 transition-colors">
+
+                            {/* Label */}
+                            <input
+                              type="text"
+                              value={item.label}
+                              onChange={e => updateInternalLoadItem(item.id, 'label', e.target.value)}
+                              className="bg-slate-900 border border-slate-700 rounded-lg py-1.5 px-3 text-white text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full"
+                              placeholder="Label"
+                            />
+
+                            {/* Category */}
+                            <select
+                              value={item.category}
+                              onChange={e => updateInternalLoadItem(item.id, 'category', e.target.value)}
+                              className={selectCls}
+                            >
+                              <option value="people">People</option>
+                              <option value="lighting">Lighting</option>
+                              <option value="equipment">Equipment</option>
+                              <option value="appliance">Appliance</option>
+                            </select>
+
+                            {/* Count */}
+                            <input
+                              type="number"
+                              min={0}
+                              value={item.count}
+                              onChange={e => updateInternalLoadItem(item.id, 'count', Number(e.target.value))}
+                              className="bg-slate-900 border border-slate-700 rounded-lg py-1.5 px-2 text-white text-sm font-mono text-center focus:ring-2 focus:ring-blue-500 outline-none w-full"
+                            />
+
+                            {/* Watts per unit */}
+                            <div className="relative">
+                              <input
+                                type="number"
+                                min={0}
+                                value={item.wattsPerUnit}
+                                onChange={e => updateInternalLoadItem(item.id, 'wattsPerUnit', Number(e.target.value))}
+                                className="bg-slate-900 border border-slate-700 rounded-lg py-1.5 pl-2 pr-7 text-white text-sm font-mono text-center focus:ring-2 focus:ring-blue-500 outline-none w-full"
+                              />
+                              <span className="absolute right-2 top-1.5 text-slate-500 text-xs pointer-events-none">W</span>
+                            </div>
+
+                            {/* Schedule preset */}
+                            <select
+                              value={item.schedulePreset}
+                              onChange={e => updateInternalLoadItem(item.id, 'schedulePreset', e.target.value)}
+                              className={selectCls}
+                            >
+                              {Object.entries(SCHEDULE_LABELS).map(([val, lbl]) => (
+                                <option key={val} value={val}>{lbl}</option>
+                              ))}
+                            </select>
+
+                            {/* Peak watts (count × W/unit) */}
+                            <div className="text-right">
+                              <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded border ${CATEGORY_COLORS[item.category]}`}>
+                                {(item.count * item.wattsPerUnit).toLocaleString()} W
+                              </span>
+                            </div>
+
+                            {/* Remove */}
+                            <button
+                              onClick={() => removeInternalLoadItem(item.id)}
+                              className="text-slate-600 hover:text-red-500 transition-colors flex justify-center"
+                              title="Remove item"
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Summary footer */}
+                    {internalLoadItems.length > 0 && (
+                      <div className="border-t border-slate-800 pt-4 grid grid-cols-2 md:grid-cols-4 gap-4">
+                        {(['people', 'lighting', 'equipment', 'appliance'] as const).map(cat => {
+                          const catW = internalLoadItems
+                            .filter(i => i.category === cat)
+                            .reduce((s, i) => s + i.count * i.wattsPerUnit, 0);
+                          if (catW === 0) return null;
+                          return (
+                            <div key={cat} className={`p-3 rounded-xl border ${CATEGORY_COLORS[cat]} bg-opacity-10`}>
+                              <p className="text-[10px] uppercase font-bold tracking-widest capitalize mb-1">{cat}</p>
+                              <p className="text-lg font-mono font-bold">{catW.toLocaleString()} W</p>
+                            </div>
+                          );
+                        })}
+                        <div className="col-span-2 md:col-span-4 p-4 bg-slate-800 rounded-xl flex justify-between items-center">
+                          <div>
+                            <p className="text-xs text-slate-400 uppercase font-bold tracking-widest">Rated Peak Total</p>
+                            <p className="text-[10px] text-slate-500 mt-0.5">at schedule factor = 1.0 · actual output varies by hour</p>
+                          </div>
+                          <p className="text-2xl font-mono font-bold text-white">{peakRatedW.toLocaleString()} <span className="text-sm font-normal text-slate-400">W</span></p>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           </div>
         )}
