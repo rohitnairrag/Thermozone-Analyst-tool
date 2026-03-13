@@ -1,15 +1,27 @@
 import React from 'react';
-import { SimulationDataPoint, WallDef, WindowDef } from '../types';
+import { SimulationDataPoint, WallDef } from '../types';
 import { Bug, Sun, LayoutGrid, Calculator } from 'lucide-react';
 
 interface Props {
   dataPoint: SimulationDataPoint;
   walls: WallDef[];
-  windows: WindowDef[];
 }
 
-const DebugPanel: React.FC<Props> = ({ dataPoint, walls, windows }) => {
+const DebugPanel: React.FC<Props> = ({ dataPoint, walls }) => {
   if (!dataPoint) return null;
+
+  // Flatten all glazing entries from walls for the debug table
+  const glazingEntries: { debugKey: string; label: string }[] = [];
+  (walls || []).forEach((wall, wIdx) => {
+    if (wall.wallType === 'internal') return;
+    if (wall.constructionType === 'full_glass') {
+      glazingEntries.push({ debugKey: `full_glass_${wall.id}`, label: `Wall ${wIdx + 1} Full Glass (${wall.direction})` });
+    } else if (wall.constructionType === 'mixed') {
+      (wall.windows || []).forEach((win, winIdx) => {
+        glazingEntries.push({ debugKey: `win_${win.id}`, label: `Wall ${wIdx + 1} Win ${winIdx + 1} (${wall.direction})` });
+      });
+    }
+  });
 
   return (
     <div className="bg-slate-900 border border-slate-800 rounded-2xl p-6 space-y-8 font-mono text-xs">
@@ -68,17 +80,17 @@ const DebugPanel: React.FC<Props> = ({ dataPoint, walls, windows }) => {
         </div>
       </div>
 
-      {/* Window Details */}
+      {/* Glazing Details */}
       <div className="space-y-4">
         <div className="flex items-center gap-2 text-orange-400 border-b border-slate-800 pb-2">
           <LayoutGrid size={14} />
-          <span className="font-bold uppercase">Window Verification</span>
+          <span className="font-bold uppercase">Glazing Verification</span>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse">
             <thead>
               <tr className="text-slate-500 border-b border-slate-800">
-                <th className="py-2 font-normal">ID/Dir</th>
+                <th className="py-2 font-normal">Surface</th>
                 <th className="py-2 font-normal text-right">Azimuth</th>
                 <th className="py-2 font-normal text-right">cos(θ)</th>
                 <th className="py-2 font-normal text-right">I (W/m²)</th>
@@ -86,14 +98,12 @@ const DebugPanel: React.FC<Props> = ({ dataPoint, walls, windows }) => {
               </tr>
             </thead>
             <tbody>
-              {(windows || []).map((win, idx) => {
-                const windowId = `win_${win.id}`;
-                const debug = dataPoint.windowDebug[windowId];
-                const wall = walls.find(w => w.id === win.wallId);
-                if (!debug || !wall) return null;
+              {glazingEntries.map(entry => {
+                const debug = dataPoint.windowDebug[entry.debugKey];
+                if (!debug) return null;
                 return (
-                  <tr key={win.id} className="border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors">
-                    <td className="py-2 text-white">Win {idx + 1} ({wall.direction})</td>
+                  <tr key={entry.debugKey} className="border-b border-slate-800/50 hover:bg-slate-800/30 transition-colors">
+                    <td className="py-2 text-white">{entry.label}</td>
                     <td className="py-2 text-white text-right">{debug.azimuth}°</td>
                     <td className="py-2 text-white text-right">{debug.cosTheta.toFixed(4)}</td>
                     <td className="py-2 text-white text-right">{debug.incidentRadiation.toFixed(1)}</td>
@@ -101,6 +111,11 @@ const DebugPanel: React.FC<Props> = ({ dataPoint, walls, windows }) => {
                   </tr>
                 );
               })}
+              {glazingEntries.length === 0 && (
+                <tr>
+                  <td colSpan={5} className="py-4 text-center text-slate-600">No glazing surfaces defined</td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>

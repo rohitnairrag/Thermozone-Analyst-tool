@@ -158,44 +158,70 @@ export const calculateHeatLoad = (
 
     // 4. Window Solar Gain & Wall Conduction
     const walls = zone.walls || [];
-    const windows = zone.windows || [];
     const hourWindowGains: Record<string, number> = {};
     const hourWindowDebug: Record<string, { azimuth: number; cosTheta: number; incidentRadiation: number; solarGain: number }> = {};
 
     walls.forEach(wDef => {
-      const wallWindows = windows.filter(win => win.wallId === wDef.id);
-      const totalWindowAreaOnWall = wallWindows.reduce((sum, win) => sum + win.areaM2, 0);
+      // Internal walls: both sides are conditioned — skip solar gain, negligible conduction delta
+      if (wDef.wallType === 'internal') return;
 
-      wallWindows.forEach(win => {
+      const totalWallArea = wDef.lengthM * zone.ceilingHeightM;
+
+      if (wDef.constructionType === 'full_glass') {
+        // Entire wall face is glazing (e.g. glass facade)
         const gammaS = sunAzimuthDeg * Math.PI / 180;
         const gammaW = wDef.azimuth * Math.PI / 180;
         const cosTheta = Math.max(0, Math.cos(alpha) * Math.cos(gammaS - gammaW));
-
         const diffuseComponent = 0.5 * dhi * (1 + Math.sin(alpha));
         const groundComponent = 0.5 * GROUND_REFLECTANCE * ghi;
         const iWin = (alpha > 0 ? dni * cosTheta : 0) + diffuseComponent + groundComponent;
 
-        const qSolar = win.areaM2 * FRAME_FACTOR * SHGC * iWin;
-        const qGlass = U_GLASS * win.areaM2 * (outdoorTemp - currentIndoorTemp);
-
+        const qSolar = totalWallArea * FRAME_FACTOR * SHGC * iWin;
+        const qGlass = U_GLASS * totalWallArea * (outdoorTemp - currentIndoorTemp);
         solar += qSolar;
         glass += Math.max(0, qGlass);
 
-        const windowId = `win_${win.id}`;
-        hourWindowGains[windowId] = qSolar;
-        hourWindowDebug[windowId] = { azimuth: wDef.azimuth, cosTheta, incidentRadiation: iWin, solarGain: qSolar };
-      });
+        const glassId = `full_glass_${wDef.id}`;
+        hourWindowGains[glassId] = qSolar;
+        hourWindowDebug[glassId] = { azimuth: wDef.azimuth, cosTheta, incidentRadiation: iWin, solarGain: qSolar };
 
-      const wallNetArea = Math.max(0, (wDef.lengthM * zone.ceilingHeightM) - totalWindowAreaOnWall);
-      const gammaS_wall = sunAzimuthDeg * Math.PI / 180;
-      const gammaW_wall = wDef.azimuth * Math.PI / 180;
-      const cosThetaWall = Math.max(0, Math.cos(alpha) * Math.cos(gammaS_wall - gammaW_wall));
-      const diffuseFactor = 0.5 * (1 + Math.sin(alpha));
-      const iWall = alpha > 0 ? (dni * cosThetaWall + diffuseFactor * dhi + 0.5 * GROUND_REFLECTANCE * ghi) : 0;
+      } else {
+        // 'opaque' or 'mixed' — process embedded windows, then remaining solid area
+        let totalWindowAreaOnWall = 0;
 
-      const tSolair = outdoorTemp + (ALPHA_WALL * iWall / H_OUT);
-      const qWall = THERMAL_MASS_FACTOR * U_WALL * wallNetArea * (tSolair - currentIndoorTemp);
-      wall += Math.max(0, qWall);
+        if (wDef.constructionType === 'mixed') {
+          (wDef.windows || []).forEach(win => {
+            const gammaS = sunAzimuthDeg * Math.PI / 180;
+            const gammaW = wDef.azimuth * Math.PI / 180;
+            const cosTheta = Math.max(0, Math.cos(alpha) * Math.cos(gammaS - gammaW));
+            const diffuseComponent = 0.5 * dhi * (1 + Math.sin(alpha));
+            const groundComponent = 0.5 * GROUND_REFLECTANCE * ghi;
+            const iWin = (alpha > 0 ? dni * cosTheta : 0) + diffuseComponent + groundComponent;
+
+            const qSolar = win.areaM2 * FRAME_FACTOR * SHGC * iWin;
+            const qGlass = U_GLASS * win.areaM2 * (outdoorTemp - currentIndoorTemp);
+            solar += qSolar;
+            glass += Math.max(0, qGlass);
+            totalWindowAreaOnWall += win.areaM2;
+
+            const windowId = `win_${win.id}`;
+            hourWindowGains[windowId] = qSolar;
+            hourWindowDebug[windowId] = { azimuth: wDef.azimuth, cosTheta, incidentRadiation: iWin, solarGain: qSolar };
+          });
+        }
+
+        // Solid wall conduction (opaque area only)
+        const wallNetArea = Math.max(0, totalWallArea - totalWindowAreaOnWall);
+        const gammaS_wall = sunAzimuthDeg * Math.PI / 180;
+        const gammaW_wall = wDef.azimuth * Math.PI / 180;
+        const cosThetaWall = Math.max(0, Math.cos(alpha) * Math.cos(gammaS_wall - gammaW_wall));
+        const diffuseFactor = 0.5 * (1 + Math.sin(alpha));
+        const iWall = alpha > 0 ? (dni * cosThetaWall + diffuseFactor * dhi + 0.5 * GROUND_REFLECTANCE * ghi) : 0;
+
+        const tSolair = outdoorTemp + (ALPHA_WALL * iWall / H_OUT);
+        const qWall = THERMAL_MASS_FACTOR * U_WALL * wallNetArea * (tSolair - currentIndoorTemp);
+        wall += Math.max(0, qWall);
+      }
     });
 
     // RTS Implementation

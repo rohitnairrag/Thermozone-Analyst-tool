@@ -1,7 +1,10 @@
 export type Direction = 'N' | 'S' | 'E' | 'W' | 'NE' | 'NW' | 'SE' | 'SW';
-export interface WindowDef {
+
+export type WallType = 'external' | 'internal';
+export type ConstructionType = 'opaque' | 'mixed' | 'full_glass';
+
+export interface EmbeddedWindow {
   id: string;
-  wallId: string;
   areaM2: number;
 }
 
@@ -10,6 +13,11 @@ export interface WallDef {
   lengthM: number;
   direction: Direction;
   azimuth: number;
+  wallType: WallType;
+  constructionType: ConstructionType;
+  adjacentZoneId?: string;   // internal walls only
+  windows?: EmbeddedWindow[]; // external + mixed only
+  glassAreaM2?: number;       // internal + mixed only
 }
 
 export interface ZoneParams {
@@ -17,7 +25,6 @@ export interface ZoneParams {
   ceilingHeightM: number;
   isTopFloor: boolean;
   walls: WallDef[];
-  windows: WindowDef[];
 }
 
 export interface ACUnit {
@@ -68,12 +75,12 @@ export interface SimulationDataPoint {
   internalLoad: number;
   peopleLoad: number;
   otherLoad: number;
-  
-  totalHeatLoad: number; // Sum of all above
-  windowGains: Record<string, number>; // Individual window gains by ID
-  coolingCapacityAvailable: number; 
-  acOutputWatts: number; 
-  indoorTempRaw: number; 
+
+  totalHeatLoad: number;
+  windowGains: Record<string, number>;
+  coolingCapacityAvailable: number;
+  acOutputWatts: number;
+  indoorTempRaw: number;
   setPoint: number;
 
   // Debug Fields

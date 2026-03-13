@@ -3,7 +3,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer,
   AreaChart, Area, ReferenceLine
 } from 'recharts';
-import { SimulationResult, SimulationDataPoint, WallDef, WindowDef } from '../types';
+import { SimulationResult, SimulationDataPoint, WallDef } from '../types';
 import { AlertTriangle, CheckCircle, Zap, CloudSun } from 'lucide-react';
 
 interface TooltipEntry {
@@ -62,10 +62,9 @@ interface Props {
   ratedCapacityWatts: number;
   locationName?: string;
   walls?: WallDef[];
-  windows?: WindowDef[];
 }
 
-const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locationName, walls = [], windows = [] }) => {
+const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locationName, walls = [] }) => {
   const peakLoadTR = (results.peakLoadWatts / 3517).toFixed(2);
   const acCapacityTR = (ratedCapacityWatts / 3517).toFixed(2);
   const chartData = results.data;
@@ -214,9 +213,17 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
               <Tooltip content={<CustomTooltip />} />
               <Legend />
               {Object.keys(chartData[0]?.windowGains || {}).map((winId, index) => {
-                const winDef = windows.find(w => `win_${w.id}` === winId);
-                const wallDef = winDef ? walls.find(w => w.id === winDef.wallId) : null;
-                const label = wallDef ? `Win ${index + 1} (${wallDef.direction})` : `Window ${index + 1}`;
+                // Resolve label from new embedded wall structure
+                let label = `Window ${index + 1}`;
+                if (winId.startsWith('full_glass_')) {
+                  const wallId = winId.replace('full_glass_', '');
+                  const wallDef = walls.find(w => w.id === wallId);
+                  if (wallDef) label = `Full Glass (${wallDef.direction})`;
+                } else if (winId.startsWith('win_')) {
+                  const embeddedWinId = winId.replace('win_', '');
+                  const wallDef = walls.find(w => w.windows?.some(win => win.id === embeddedWinId));
+                  if (wallDef) label = `Win ${index + 1} (${wallDef.direction})`;
+                }
 
                 return (
                   <Line

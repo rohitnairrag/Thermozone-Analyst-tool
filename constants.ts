@@ -5,15 +5,25 @@ export const DEFAULT_ZONE: ZoneParams = {
   ceilingHeightM: 2.7,
   isTopFloor: false,
   walls: [
-    { id: 'w1', lengthM: 10, direction: 'N', azimuth: 0 },
-    { id: 'w2', lengthM: 6, direction: 'E', azimuth: 90 },
-    { id: 'w3', lengthM: 10, direction: 'S', azimuth: 180 },
-    { id: 'w4', lengthM: 6, direction: 'W', azimuth: 270 },
+    {
+      id: 'w1', lengthM: 10, direction: 'N', azimuth: 0,
+      wallType: 'external', constructionType: 'mixed',
+      windows: [{ id: 'win1', areaM2: 2 }]
+    },
+    {
+      id: 'w2', lengthM: 6, direction: 'E', azimuth: 90,
+      wallType: 'external', constructionType: 'opaque'
+    },
+    {
+      id: 'w3', lengthM: 10, direction: 'S', azimuth: 180,
+      wallType: 'external', constructionType: 'opaque'
+    },
+    {
+      id: 'w4', lengthM: 6, direction: 'W', azimuth: 270,
+      wallType: 'external', constructionType: 'mixed',
+      windows: [{ id: 'win2', areaM2: 1.5 }]
+    },
   ],
-  windows: [
-    { id: 'win1', wallId: 'w1', areaM2: 2 },
-    { id: 'win2', wallId: 'w4', areaM2: 1.5 },
-  ]
 };
 
 export const DEFAULT_ACS: ACUnit[] = [
@@ -21,12 +31,12 @@ export const DEFAULT_ACS: ACUnit[] = [
 ];
 
 export const ORIENTATION_LABELS: Record<string, string> = {
-  'N': 'North Window',
-  'NE': 'North-East Window',
-  'E': 'East Window',
-  'SE': 'South-East Window',
-  'S': 'South Window',
-  'SW': 'South-West Window',
-  'W': 'West Window',
-  'NW': 'North-West Window'
+  'N': 'North Wall',
+  'NE': 'North-East Wall',
+  'E': 'East Wall',
+  'SE': 'South-East Wall',
+  'S': 'South Wall',
+  'SW': 'South-West Wall',
+  'W': 'West Wall',
+  'NW': 'North-West Wall'
 };
