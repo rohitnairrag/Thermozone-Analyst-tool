@@ -177,9 +177,9 @@ app.get('/api/historical-temp', async (req, res) => {
       ? req.query.date
       : todayIST;
 
-    // Calculate yesterday's date
-    const dateObj = new Date(date + 'T00:00:00+05:30');
-    dateObj.setDate(dateObj.getDate() - 1);
+    // Calculate yesterday's date (UTC noon avoids any DST/TZ boundary issues)
+    const dateObj = new Date(date + 'T12:00:00Z');
+    dateObj.setUTCDate(dateObj.getUTCDate() - 1);
     const yesterday = dateObj.toISOString().slice(0, 10);
 
     // Fetch both days in parallel
@@ -285,8 +285,9 @@ app.get('/api/historical-ac-output', async (req, res) => {
       ? req.query.date
       : todayIST;
 
-    const dateObj = new Date(date + 'T00:00:00+05:30');
-    dateObj.setDate(dateObj.getDate() - 1);
+    // Calculate yesterday's date (UTC noon avoids any DST/TZ boundary issues)
+    const dateObj = new Date(date + 'T12:00:00Z');
+    dateObj.setUTCDate(dateObj.getUTCDate() - 1);
     const yesterday = dateObj.toISOString().slice(0, 10);
 
     const [todayMap, yesterdayMap] = await Promise.all([

@@ -204,8 +204,15 @@ function App() {
   useEffect(() => {
     if (!weather || !zone) return;
     try {
-      const realTemps = historicalTemps?.hasData ? historicalTemps.temps : null;
-      const realAcOutputs = historicalAcOutput?.hasData ? historicalAcOutput.acOutputs : null;
+      // Guard: only use DB data when it matches the currently-selected date.
+      // Without this check a race condition causes the sim to fire with stale
+      // data from the previous date while the new fetch is still in-flight.
+      const realTemps = (historicalTemps?.hasData && historicalTemps.date === selectedDate)
+        ? historicalTemps.temps
+        : null;
+      const realAcOutputs = (historicalAcOutput?.hasData && historicalAcOutput.date === selectedDate)
+        ? historicalAcOutput.acOutputs
+        : null;
       const inventoryItems = activeProfile?.internalLoads;
       const res = calculateHeatLoad(zone, acList, weather, location.lat, location.lon, realTemps, realAcOutputs, inventoryItems);
       setResults(res);
