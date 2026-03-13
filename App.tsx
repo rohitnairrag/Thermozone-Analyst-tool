@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Activity, Thermometer, Wind, Server, Plus, Trash2, Map, Clock, LayoutGrid, Bug, Pencil, X, Flame } from 'lucide-react';
+import { Activity, Thermometer, Wind, Server, Plus, Trash2, Map, Clock, LayoutGrid, Bug, Pencil, X, Flame, RotateCcw } from 'lucide-react';
 import { DEFAULT_ACS, DEFAULT_ZONE } from './constants';
 import { calculateHeatLoad } from './services/physicsEngine';
 import ResultsDashboard from './components/ResultsDashboard';
@@ -272,6 +272,22 @@ function App() {
     setZones(prev => [...prev, newProfile]);
     setActiveZoneId(newId);
     setActiveTab('configure'); // go straight to config so user can set up the zone
+  };
+
+  // Reset the active zone back to the hardcoded DEFAULT_ZONE1 baseline.
+  // Preserves the zone's id so existing data references remain valid.
+  const resetZoneToDefault = () => {
+    if (!window.confirm(
+      `Reset "${activeProfile?.zone.name ?? 'this zone'}" to factory defaults?\n\n` +
+      `All wall, AC and internal-load edits for this zone will be replaced with the ` +
+      `original Zone 1 configuration. This cannot be undone.`
+    )) return;
+    const targetId = activeZoneId || zones[0]?.id;
+    setZones(prev => prev.map(z =>
+      z.id === targetId
+        ? { ...DEFAULT_ZONE1, id: z.id }   // keep the same id, restore everything else
+        : z
+    ));
   };
 
   // --- Wall Modal Handlers ---
@@ -794,12 +810,21 @@ function App() {
                         </h3>
                         <p className="text-xs text-slate-500 mt-1">Define walls sequentially to build the room perimeter.</p>
                       </div>
-                      <button
-                        onClick={openAddWallModal}
-                        className="flex items-center gap-2 text-xs bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg transition-colors shadow-lg shadow-blue-900/20"
-                      >
-                        <Plus size={16} /> Add Wall
-                      </button>
+                      <div className="flex items-center gap-2">
+                        <button
+                          onClick={resetZoneToDefault}
+                          title="Reset this zone to factory default configuration"
+                          className="flex items-center gap-2 text-xs text-slate-400 hover:text-orange-300 border border-slate-700 hover:border-orange-700 px-3 py-2 rounded-lg transition-colors"
+                        >
+                          <RotateCcw size={14} /> Reset to Default
+                        </button>
+                        <button
+                          onClick={openAddWallModal}
+                          className="flex items-center gap-2 text-xs bg-blue-600 hover:bg-blue-500 text-white px-4 py-2 rounded-lg transition-colors shadow-lg shadow-blue-900/20"
+                        >
+                          <Plus size={16} /> Add Wall
+                        </button>
+                      </div>
                     </div>
 
                     {(zone.walls || []).length === 0 ? (
