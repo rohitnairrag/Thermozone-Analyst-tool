@@ -220,6 +220,115 @@ const ResultsDashboard: React.FC<Props> = ({ results, ratedCapacityWatts, locati
         </div>
       </div>
 
+      {/* Hourly Verdict Table */}
+      <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-lg font-semibold text-white">Hourly AC Verdict</h3>
+          <span className="text-xs text-slate-400 font-mono bg-slate-700 px-2 py-1 rounded">
+            {timeRangeLabel}
+          </span>
+        </div>
+
+        {/* Legend */}
+        <div className="flex gap-4 mb-3">
+          <div className="flex items-center gap-1.5 text-xs text-slate-400">
+            <span className="inline-block w-2.5 h-2.5 rounded-sm bg-green-500/80" />
+            Sufficient — AC output ≥ heat load
+          </div>
+          <div className="flex items-center gap-1.5 text-xs text-slate-400">
+            <span className="inline-block w-2.5 h-2.5 rounded-sm bg-red-500/80" />
+            Undersized — AC output &lt; heat load
+          </div>
+          <div className="flex items-center gap-1.5 text-xs text-slate-400">
+            <span className="inline-block w-2.5 h-2.5 rounded-sm bg-slate-600" />
+            AC off / no load
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead>
+              <tr className="text-slate-400 border-b border-slate-700">
+                <th className="text-left py-2 pr-4 font-medium">Hour</th>
+                <th className="text-right py-2 pr-4 font-medium">Outdoor °C</th>
+                <th className="text-right py-2 pr-4 font-medium">Heat Load</th>
+                <th className="text-right py-2 pr-4 font-medium">AC Output</th>
+                <th className="text-right py-2 pr-4 font-medium">Gap</th>
+                <th className="text-center py-2 font-medium">Verdict</th>
+              </tr>
+            </thead>
+            <tbody>
+              {chartData.map((d, i) => {
+                const load = Math.round(d.totalHeatLoad);
+                const output = Math.round(d.acOutputWatts);
+                const gap = output - load;
+                const acOff = output === 0 && load === 0;
+                const sufficient = output >= load;
+
+                let rowBg = '';
+                let verdictBg = '';
+                let verdictText = '';
+                let verdictLabel = '';
+
+                if (acOff) {
+                  rowBg = '';
+                  verdictBg = 'bg-slate-700 text-slate-400';
+                  verdictLabel = 'AC OFF';
+                } else if (sufficient) {
+                  rowBg = 'bg-green-900/10';
+                  verdictBg = 'bg-green-500/20 text-green-400';
+                  verdictLabel = '✓ SUFFICIENT';
+                } else {
+                  rowBg = 'bg-red-900/10';
+                  verdictBg = 'bg-red-500/20 text-red-400';
+                  verdictLabel = '✗ UNDERSIZED';
+                }
+
+                return (
+                  <tr
+                    key={i}
+                    className={`border-b border-slate-700/50 hover:bg-slate-700/30 transition-colors ${rowBg}`}
+                  >
+                    <td className="py-1.5 pr-4 font-mono text-slate-300">{d.time}</td>
+                    <td className="py-1.5 pr-4 text-right font-mono text-slate-300">{d.outdoorTemp.toFixed(1)}</td>
+                    <td className="py-1.5 pr-4 text-right font-mono text-white">{load.toLocaleString()} W</td>
+                    <td className="py-1.5 pr-4 text-right font-mono text-blue-300">{output.toLocaleString()} W</td>
+                    <td className={`py-1.5 pr-4 text-right font-mono ${gap >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                      {gap >= 0 ? '+' : ''}{gap.toLocaleString()} W
+                    </td>
+                    <td className="py-1.5 text-center">
+                      <span className={`inline-block px-2 py-0.5 rounded text-xs font-semibold ${verdictBg}`}>
+                        {verdictLabel}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+
+        {/* Summary footer */}
+        {(() => {
+          const activeHours = chartData.filter(d => !(d.totalHeatLoad === 0 && d.acOutputWatts === 0));
+          const sufficientCount = activeHours.filter(d => d.acOutputWatts >= d.totalHeatLoad).length;
+          const undersizedCount = activeHours.length - sufficientCount;
+          return activeHours.length > 0 ? (
+            <div className="mt-3 pt-3 border-t border-slate-700 flex gap-6 text-xs text-slate-400">
+              <span>Active hours: <span className="text-white font-semibold">{activeHours.length}</span></span>
+              <span className="text-green-400">✓ Sufficient: <span className="font-semibold">{sufficientCount}h</span></span>
+              <span className="text-red-400">✗ Undersized: <span className="font-semibold">{undersizedCount}h</span></span>
+              <span>
+                Efficiency score:{' '}
+                <span className="font-semibold text-white">
+                  {((sufficientCount / activeHours.length) * 100).toFixed(0)}%
+                </span>
+              </span>
+            </div>
+          ) : null;
+        })()}
+      </div>
+
       {/* Window Gains Chart */}
       <div className="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
         <h3 className="text-lg font-semibold text-white mb-6">Individual Window Heat Gain vs Time</h3>
