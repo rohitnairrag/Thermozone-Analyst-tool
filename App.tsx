@@ -2004,7 +2004,7 @@ function App() {
                   isToday={isToday}
                   acOutputSource={historicalAcOutput ? {
                     hasData: historicalAcOutput.hasData,
-                    hoursFromToday: historicalAcOutput.hoursFromToday,
+                    hoursWithAcOn: historicalAcOutput.acOutputs.filter((v): v is number => v != null && v > 0).length,
                     hoursFromYesterday: historicalAcOutput.hoursFromYesterday,
                     totalElecKwh: historicalAcOutput.acOutputs
                       .filter((v): v is number => v !== null)

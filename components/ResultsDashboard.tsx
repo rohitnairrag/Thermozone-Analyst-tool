@@ -68,7 +68,7 @@ interface Props {
   locationName?: string;
   walls?: WallDef[];
   isToday?: boolean;
-  acOutputSource?: { hasData: boolean; hoursFromToday: number; hoursFromYesterday: number; totalElecKwh?: number };
+  acOutputSource?: { hasData: boolean; hoursWithAcOn: number; hoursFromYesterday: number; totalElecKwh?: number };
   acBreakdown?: AcBreakdownData;
   liveData?: LiveTempData;
   subZoneConfigs?: SubZoneConfig[];
@@ -821,7 +821,7 @@ const ResultsDashboard: React.FC<Props> = ({
               {acOutputSource ? (
                 <p className="text-xs mt-1">
                   {acOutputSource.hasData ? (
-                    <span className="text-blue-400">● AC Output: sensor data ({acOutputSource.hoursFromToday} hrs with AC on)</span>
+                    <span className="text-blue-400">● AC Output: sensor data ({acOutputSource.hoursWithAcOn} hrs with AC on)</span>
                   ) : (
                     <span className="text-slate-500">◌ AC Output: no sensor data for this date — showing 0</span>
                   )}
@@ -848,8 +848,7 @@ const ResultsDashboard: React.FC<Props> = ({
                   dataKey="time"
                   stroke="#94a3b8"
                   fontSize={11}
-                  interval={11}
-                  tickFormatter={(t: string) => t.endsWith(':00') ? t : ''}
+                  ticks={['00:00','02:00','04:00','06:00','08:00','10:00','12:00','14:00','16:00','18:00','20:00','22:00']}
                 />
                 <YAxis
                   stroke="#94a3b8"
@@ -882,8 +881,7 @@ const ResultsDashboard: React.FC<Props> = ({
                   dataKey="time"
                   stroke="#94a3b8"
                   fontSize={11}
-                  interval={11}
-                  tickFormatter={(t: string) => t.endsWith(':00') ? t : ''}
+                  ticks={['00:00','02:00','04:00','06:00','08:00','10:00','12:00','14:00','16:00','18:00','20:00','22:00']}
                 />
                 <YAxis stroke="#94a3b8" fontSize={12} width={45} label={{ value: 'Watts', angle: -90, position: 'insideLeft', fill: '#94a3b8', offset: 0 }} />
                 <Tooltip content={<CustomTooltip />} />
