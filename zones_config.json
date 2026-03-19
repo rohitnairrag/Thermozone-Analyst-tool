@@ -1,0 +1,531 @@
+{
+  "savedAt": "2026-03-19T08:41:34.868Z",
+  "zones": [
+    {
+      "id": "zone1-default",
+      "zone": {
+        "name": "Zone 1",
+        "ceilingHeightM": 3,
+        "isTopFloor": false,
+        "walls": [
+          {
+            "id": "w1",
+            "lengthM": 10.06,
+            "direction": "SE",
+            "azimuth": 135,
+            "wallType": "external",
+            "constructionType": "mixed",
+            "windows": [
+              {
+                "id": "1773466680748",
+                "areaM2": 13.48
+              }
+            ]
+          },
+          {
+            "id": "w2",
+            "lengthM": 7.01,
+            "direction": "SW",
+            "azimuth": 225,
+            "wallType": "external",
+            "constructionType": "mixed",
+            "windows": [
+              {
+                "id": "1773466739465",
+                "areaM2": 9.3934
+              }
+            ]
+          },
+          {
+            "id": "w3",
+            "lengthM": 2.62,
+            "direction": "NW",
+            "azimuth": 315,
+            "wallType": "internal",
+            "constructionType": "mixed",
+            "adjacentZoneId": "zone2-default",
+            "glassAreaM2": 6.1
+          },
+          {
+            "id": "w4",
+            "lengthM": 3.04,
+            "direction": "SW",
+            "azimuth": 225,
+            "wallType": "internal",
+            "constructionType": "mixed",
+            "adjacentZoneId": "zone2-default",
+            "glassAreaM2": 7.1
+          },
+          {
+            "id": "w5",
+            "lengthM": 5.42,
+            "direction": "SW",
+            "azimuth": 225,
+            "wallType": "internal",
+            "constructionType": "mixed",
+            "adjacentZoneId": "zone3-default",
+            "glassAreaM2": 12.7
+          },
+          {
+            "id": "w6",
+            "lengthM": 4.85,
+            "direction": "NW",
+            "azimuth": 315,
+            "wallType": "external",
+            "constructionType": "mixed",
+            "windows": [
+              {
+                "id": "1773467024035",
+                "areaM2": 11.2
+              }
+            ]
+          },
+          {
+            "id": "w7",
+            "lengthM": 5.59,
+            "direction": "NE",
+            "azimuth": 45,
+            "wallType": "internal",
+            "constructionType": "opaque"
+          },
+          {
+            "id": "w8",
+            "lengthM": 3.7,
+            "direction": "NE",
+            "azimuth": 45,
+            "wallType": "internal",
+            "constructionType": "opaque"
+          },
+          {
+            "id": "w9",
+            "lengthM": 1.92,
+            "direction": "NE",
+            "azimuth": 45,
+            "wallType": "internal",
+            "constructionType": "opaque",
+            "adjacentZoneId": "zone4-default"
+          },
+          {
+            "id": "w10",
+            "lengthM": 4.26,
+            "direction": "NE",
+            "azimuth": 45,
+            "wallType": "external",
+            "constructionType": "mixed",
+            "windows": [
+              {
+                "id": "1773467069224",
+                "areaM2": 5.7
+              }
+            ]
+          },
+          {
+            "id": "w11",
+            "lengthM": 1.7,
+            "direction": "NW",
+            "azimuth": 315,
+            "wallType": "internal",
+            "constructionType": "opaque",
+            "adjacentZoneId": "zone4-default"
+          },
+          {
+            "id": "w12",
+            "lengthM": 2.69,
+            "direction": "NW",
+            "azimuth": 315,
+            "wallType": "internal",
+            "constructionType": "opaque",
+            "adjacentZoneId": "zone4-default"
+          },
+          {
+            "id": "w13",
+            "lengthM": 1.8,
+            "direction": "SE",
+            "azimuth": 135,
+            "wallType": "internal",
+            "constructionType": "opaque",
+            "adjacentZoneId": "zone4-default"
+          }
+        ],
+        "displayName": "Main Working Area",
+        "subZones": [
+          {
+            "name": "Working Area 1",
+            "areaM2": 54.4113
+          },
+          {
+            "name": "Working Area 2",
+            "areaM2": 34.494
+          },
+          {
+            "name": "Embedded Team",
+            "areaM2": 4.4955
+          }
+        ]
+      },
+      "ac": [
+        {
+          "id": "ac-auto-ac1",
+          "name": "AC1",
+          "ratedCapacityWatts": 6200,
+          "iseer": 3.7,
+          "ageYears": 1,
+          "dbSensorName": "AC1",
+          "primarySubZones": [
+            "Working Area 1"
+          ],
+          "spilloverSubZones": [
+            "Embedded Team"
+          ]
+        },
+        {
+          "id": "ac-auto-ac2",
+          "name": "AC2",
+          "ratedCapacityWatts": 6200,
+          "iseer": 3.7,
+          "ageYears": 1,
+          "dbSensorName": "AC2",
+          "primarySubZones": [
+            "Working Area 2"
+          ],
+          "spilloverSubZones": [
+            "Embedded Team"
+          ]
+        }
+      ],
+      "internalLoads": [
+        {
+          "id": "il-people",
+          "label": "People",
+          "category": "people",
+          "count": 7,
+          "wattsPerUnit": 130,
+          "schedulePreset": "extended_office_occupancy",
+          "liveCountKey": "occupancy_zone1"
+        },
+        {
+          "id": "il-monitors",
+          "label": "Monitors",
+          "category": "equipment",
+          "count": 4,
+          "wattsPerUnit": 30,
+          "schedulePreset": "extended_office_occupancy"
+        },
+        {
+          "id": "il-laptops",
+          "label": "Laptops",
+          "category": "equipment",
+          "count": 3,
+          "wattsPerUnit": 50,
+          "schedulePreset": "extended_office_occupancy"
+        },
+        {
+          "id": "il-tube-lights",
+          "label": "Tube Lights",
+          "category": "lighting",
+          "count": 19,
+          "wattsPerUnit": 40,
+          "schedulePreset": "early_morning_lighting"
+        },
+        {
+          "id": "il-ceiling-lights",
+          "label": "Ceiling Lights",
+          "category": "lighting",
+          "count": 0,
+          "wattsPerUnit": 15,
+          "schedulePreset": "early_morning_lighting"
+        },
+        {
+          "id": "il-fans",
+          "label": "Fans",
+          "category": "equipment",
+          "count": 1,
+          "wattsPerUnit": 75,
+          "schedulePreset": "extended_office_occupancy"
+        },
+        {
+          "id": "il-cooler",
+          "label": "Air Cooler",
+          "category": "appliance",
+          "count": 1,
+          "wattsPerUnit": 150,
+          "schedulePreset": "extended_office_occupancy"
+        },
+        {
+          "id": "il-fridge",
+          "label": "Fridge",
+          "category": "appliance",
+          "count": 0,
+          "wattsPerUnit": 200,
+          "schedulePreset": "always_on"
+        }
+      ],
+      "sensorPositions": {
+        "sensor 1": "ac_level",
+        "AC1": "ac_level",
+        "AC2": "ac_level",
+        "Device 1": "desk",
+        "sensor 3 (zone 2)": "desk",
+        "Table_1": "desk",
+        "Table_3": "desk",
+        "Table_2": "desk"
+      }
+    },
+    {
+      "id": "zone2-default",
+      "zone": {
+        "name": "Zone 2",
+        "ceilingHeightM": 3,
+        "isTopFloor": false,
+        "walls": [
+          {
+            "id": "z2w1",
+            "lengthM": 2.62,
+            "direction": "SE",
+            "azimuth": 135,
+            "wallType": "internal",
+            "constructionType": "mixed",
+            "adjacentZoneId": "zone1-default",
+            "glassAreaM2": 6.2
+          },
+          {
+            "id": "z2w2",
+            "lengthM": 3.04,
+            "direction": "NE",
+            "azimuth": 45,
+            "wallType": "internal",
+            "constructionType": "mixed",
+            "adjacentZoneId": "zone1-default",
+            "glassAreaM2": 7.1
+          },
+          {
+            "id": "z2w3",
+            "lengthM": 2.62,
+            "direction": "NW",
+            "azimuth": 315,
+            "wallType": "internal",
+            "constructionType": "mixed",
+            "adjacentZoneId": "zone3-default",
+            "glassAreaM2": 6.1
+          },
+          {
+            "id": "z2w4",
+            "lengthM": 3.04,
+            "direction": "SW",
+            "azimuth": 225,
+            "wallType": "external",
+            "constructionType": "mixed",
+            "windows": [
+              {
+                "id": "z2w4-win1",
+                "areaM2": 6
+              }
+            ]
+          }
+        ],
+        "displayName": "Pantry",
+        "subZones": []
+      },
+      "ac": [
+        {
+          "id": "ac-auto-ac1",
+          "name": "AC1",
+          "ratedCapacityWatts": 6200,
+          "iseer": 3.7,
+          "ageYears": 1,
+          "dbSensorName": "AC1",
+          "primarySubZones": [
+            "Pantry 1"
+          ],
+          "spilloverSubZones": []
+        }
+      ],
+      "internalLoads": [],
+      "sensorPositions": {
+        "AC1": "ac_level"
+      },
+      "hasDeskSensors": false
+    },
+    {
+      "id": "zone3-default",
+      "zone": {
+        "name": "Zone 3",
+        "ceilingHeightM": 3,
+        "isTopFloor": false,
+        "walls": [
+          {
+            "id": "1773465947377",
+            "lengthM": 2.62,
+            "direction": "SE",
+            "azimuth": 135,
+            "wallType": "internal",
+            "constructionType": "mixed",
+            "adjacentZoneId": "zone2-default",
+            "glassAreaM2": 6.2
+          },
+          {
+            "id": "1773466108712",
+            "lengthM": 5.42,
+            "direction": "NE",
+            "azimuth": 45,
+            "wallType": "internal",
+            "constructionType": "mixed",
+            "adjacentZoneId": "zone1-default",
+            "glassAreaM2": 12.7
+          },
+          {
+            "id": "1773466526335",
+            "lengthM": 2.62,
+            "direction": "NW",
+            "azimuth": 315,
+            "wallType": "external",
+            "constructionType": "mixed",
+            "windows": [
+              {
+                "id": "1773466519935",
+                "areaM2": 6
+              }
+            ]
+          },
+          {
+            "id": "1773466551492",
+            "lengthM": 5.42,
+            "direction": "SW",
+            "azimuth": 225,
+            "wallType": "external",
+            "constructionType": "mixed",
+            "windows": [
+              {
+                "id": "1773466547148",
+                "areaM2": 4
+              }
+            ]
+          }
+        ],
+        "displayName": "Meeting Room",
+        "subZones": []
+      },
+      "ac": [
+        {
+          "id": "ac-auto-ac1",
+          "name": "AC1",
+          "ratedCapacityWatts": 6200,
+          "iseer": 3.7,
+          "ageYears": 1,
+          "dbSensorName": "AC1",
+          "primarySubZones": [
+            "Meeting Room 1"
+          ],
+          "spilloverSubZones": []
+        },
+        {
+          "id": "ac-auto-ac2",
+          "name": "AC2",
+          "ratedCapacityWatts": 6200,
+          "iseer": 3.7,
+          "ageYears": 0,
+          "dbSensorName": "AC1",
+          "primarySubZones": [
+            "Meeting Room 1"
+          ],
+          "spilloverSubZones": []
+        }
+      ],
+      "sensorPositions": {
+        "AC1": "ac_level",
+        "AC2": "ac_level",
+        "sensor 4 (conf room)": "desk"
+      }
+    },
+    {
+      "id": "zone4-default",
+      "zone": {
+        "name": "Zone 4",
+        "ceilingHeightM": 3,
+        "isTopFloor": false,
+        "walls": [
+          {
+            "id": "1773469383708",
+            "lengthM": 12.08,
+            "direction": "NE",
+            "azimuth": 45,
+            "wallType": "external",
+            "constructionType": "mixed",
+            "windows": [
+              {
+                "id": "1773469252927",
+                "areaM2": 4.26
+              }
+            ]
+          },
+          {
+            "id": "1773469428214",
+            "lengthM": 1.7,
+            "direction": "NW",
+            "azimuth": 315,
+            "wallType": "external",
+            "constructionType": "opaque"
+          },
+          {
+            "id": "1773469456638",
+            "lengthM": 5.5,
+            "direction": "SW",
+            "azimuth": 225,
+            "wallType": "internal",
+            "constructionType": "opaque",
+            "adjacentZoneId": "zone1-default"
+          },
+          {
+            "id": "1773469499951",
+            "lengthM": 1.8,
+            "direction": "NW",
+            "azimuth": 315,
+            "wallType": "internal",
+            "constructionType": "opaque",
+            "adjacentZoneId": "zone1-default"
+          },
+          {
+            "id": "1773469542611",
+            "lengthM": 3.7,
+            "direction": "SW",
+            "azimuth": 225,
+            "wallType": "internal",
+            "constructionType": "opaque",
+            "adjacentZoneId": "zone1-default"
+          },
+          {
+            "id": "1773469592398",
+            "lengthM": 1.8,
+            "direction": "SE",
+            "azimuth": 135,
+            "wallType": "internal",
+            "constructionType": "opaque",
+            "adjacentZoneId": "zone1-default"
+          },
+          {
+            "id": "1773469642548",
+            "lengthM": 1.7,
+            "direction": "SE",
+            "azimuth": 135,
+            "wallType": "internal",
+            "constructionType": "opaque",
+            "adjacentZoneId": "zone1-default"
+          },
+          {
+            "id": "1773469676769",
+            "lengthM": 1.92,
+            "direction": "SW",
+            "azimuth": 225,
+            "wallType": "internal",
+            "constructionType": "opaque",
+            "adjacentZoneId": "zone1-default"
+          }
+        ],
+        "displayName": "Corridor & Reception",
+        "subZones": []
+      },
+      "ac": []
+    }
+  ],
+  "sensorZoneOverrides": {}
+}
