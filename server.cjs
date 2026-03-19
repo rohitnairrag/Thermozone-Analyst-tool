@@ -141,14 +141,14 @@ async function getHourlyAvgsForDate(dbZones, date) {
   // Cast to TIMESTAMP first (strips tz info) then add +05:30 to get true IST time
   const result = await db.query(`
     SELECT
-      EXTRACT(HOUR FROM ((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))::INT AS hour,
+      EXTRACT(HOUR FROM ((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))::INT AS hour,
       AVG(room_temp::FLOAT) AS avg_temp
     FROM public.lt_bangalore_org_live_device_data
     WHERE site_group_name = ANY($1::text[])
-      AND DATE((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes') = $2::DATE
+      AND DATE((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes') = $2::DATE
       AND room_temp IS NOT NULL
       AND room_temp::TEXT != 'NaN'
-    GROUP BY EXTRACT(HOUR FROM ((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))
+    GROUP BY EXTRACT(HOUR FROM ((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))
     ORDER BY hour
   `, [dbZones, date]);
 
@@ -240,25 +240,27 @@ app.get('/api/historical-temp', async (req, res) => {
 // device_timestamp is stored as UTC — shift +05:30 to get IST hour/date.
 async function getHourlyAcOutputForDate(dbZones, date) {
   const result = await db.query(`
-    SELECT hour, SUM(avg_ac_output)::FLOAT AS total_watts
+    SELECT hour, COALESCE(SUM(avg_ac_output), 0)::FLOAT AS total_watts
     FROM (
       SELECT
-        EXTRACT(HOUR FROM ((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))::INT AS hour,
+        EXTRACT(HOUR FROM ((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))::INT AS hour,
         asset_name,
         AVG(
           CASE WHEN UPPER(ac_power_status) = 'ON' THEN
             CASE
-              WHEN COALESCE(r_phase_power::FLOAT, 0) + COALESCE(y_phase_power::FLOAT, 0) + COALESCE(b_phase_power::FLOAT, 0) > 0
-                THEN COALESCE(r_phase_power::FLOAT, 0) + COALESCE(y_phase_power::FLOAT, 0) + COALESCE(b_phase_power::FLOAT, 0)
-              ELSE COALESCE(power::FLOAT, 0)
+              WHEN COALESCE(NULLIF(r_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(y_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(b_phase_power::FLOAT,'NaN'::FLOAT),0) > 0
+                THEN COALESCE(NULLIF(r_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(y_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(b_phase_power::FLOAT,'NaN'::FLOAT),0)
+              WHEN COALESCE(NULLIF(power::FLOAT,'NaN'::FLOAT), 0) > 0
+                THEN COALESCE(NULLIF(power::FLOAT,'NaN'::FLOAT), 0)
+              ELSE NULL
             END
-          ELSE 0
+          ELSE NULL
           END
         ) AS avg_ac_output
       FROM public.lt_bangalore_org_live_device_data
       WHERE site_group_name = ANY($1::text[])
-        AND DATE((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes') = $2::DATE
-      GROUP BY EXTRACT(HOUR FROM ((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes')), asset_name
+        AND DATE((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes') = $2::DATE
+      GROUP BY EXTRACT(HOUR FROM ((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes')), asset_name
     ) subq
     GROUP BY hour
     ORDER BY hour
@@ -302,6 +304,42 @@ app.get('/api/historical-ac-output', async (req, res) => {
     for (let h = 0; h < 24; h++) {
       if (todayMap[h] !== undefined)      acOutputs[h] = todayMap[h];
       else if (yesterdayMap[h] !== undefined) acOutputs[h] = yesterdayMap[h];
+    }
+
+    // For today: if the current hour still has no power data, seed it from the live reading.
+    // Power columns are only populated in the very latest DB record per sensor.
+    // Once synced_at advances to the next hour the previous hour loses its power data.
+    // Seeding from live here ensures carry-forward has a real value to propagate.
+    if (date === todayIST) {
+      const nowIST = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+      const currentHour = nowIST.getHours();
+      if (acOutputs[currentHour] == null || acOutputs[currentHour] === 0) {
+        const liveResult = await db.query(`
+          SELECT COALESCE(SUM(live_power), 0)::FLOAT AS total_watts
+          FROM (
+            SELECT DISTINCT ON (asset_name)
+              CASE WHEN UPPER(ac_power_status) = 'ON' THEN
+                CASE
+                  WHEN COALESCE(NULLIF(r_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(y_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(b_phase_power::FLOAT,'NaN'::FLOAT),0) > 0
+                    THEN COALESCE(NULLIF(r_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(y_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(b_phase_power::FLOAT,'NaN'::FLOAT),0)
+                  WHEN COALESCE(NULLIF(power::FLOAT,'NaN'::FLOAT), 0) > 0
+                    THEN COALESCE(NULLIF(power::FLOAT,'NaN'::FLOAT), 0)
+                  ELSE 0
+                END
+              ELSE 0
+              END AS live_power
+            FROM public.lt_bangalore_org_live_device_data
+            WHERE site_group_name = ANY($1::text[])
+              AND room_temp IS NOT NULL
+              AND room_temp::TEXT != 'NaN'
+            ORDER BY asset_name, synced_at DESC
+          ) latest
+        `, [dbZones]);
+        const livePower = liveResult.rows[0]?.total_watts ?? 0;
+        if (livePower > 0) {
+          acOutputs[currentHour] = Math.round(livePower * 100) / 100;
+        }
+      }
     }
 
     // Carry forward
