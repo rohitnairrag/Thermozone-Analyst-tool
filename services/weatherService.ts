@@ -23,7 +23,7 @@ export const searchLocation = async (query: string): Promise<LocationData | null
 export const fetchWeather = async (lat: number, lon: number): Promise<HourlyWeather | null> => {
   try {
     // Open-Meteo forecast API — today's weather
-    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,relative_humidity_2m,direct_radiation,diffuse_radiation,shortwave_radiation&timezone=auto&forecast_days=1`;
+    const url = `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lon}&hourly=temperature_2m,relative_humidity_2m,direct_radiation,diffuse_radiation,shortwave_radiation,windspeed_10m&timezone=auto&forecast_days=1`;
     const response = await fetch(url);
     const data = await response.json();
     if (data && data.hourly) {
@@ -32,7 +32,8 @@ export const fetchWeather = async (lat: number, lon: number): Promise<HourlyWeat
         directRadiation: data.hourly.direct_radiation,
         diffuseRadiation: data.hourly.diffuse_radiation,
         shortwaveRadiation: data.hourly.shortwave_radiation,
-        relativeHumidity: data.hourly.relative_humidity_2m
+        relativeHumidity: data.hourly.relative_humidity_2m,
+        windspeed: data.hourly.windspeed_10m,
       };
     }
     return null;
@@ -60,7 +61,7 @@ export const fetchWeatherForDate = async (
     // Open-Meteo Archive API for historical dates
     const url = `https://archive-api.open-meteo.com/v1/archive?latitude=${lat}&longitude=${lon}` +
       `&start_date=${date}&end_date=${date}` +
-      `&hourly=temperature_2m,relative_humidity_2m,direct_radiation,diffuse_radiation,shortwave_radiation` +
+      `&hourly=temperature_2m,relative_humidity_2m,direct_radiation,diffuse_radiation,shortwave_radiation,windspeed_10m` +
       `&timezone=Asia%2FKolkata`;
     const response = await fetch(url);
     const data = await response.json();
@@ -70,7 +71,8 @@ export const fetchWeatherForDate = async (
         directRadiation: data.hourly.direct_radiation,
         diffuseRadiation: data.hourly.diffuse_radiation,
         shortwaveRadiation: data.hourly.shortwave_radiation,
-        relativeHumidity: data.hourly.relative_humidity_2m
+        relativeHumidity: data.hourly.relative_humidity_2m,
+        windspeed: data.hourly.windspeed_10m,
       };
     }
     return null;
