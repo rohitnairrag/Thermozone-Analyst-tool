@@ -76,7 +76,9 @@ app.get('/api/live-temp', async (req, res) => {
       .filter(([, toZone]) => toZone === appZone)
       .map(([asset]) => asset);
 
-    // device_timestamp is stored as UTC — add +05:30 to display correct IST time
+    // synced_at is reliable UTC; device_timestamp can be null or corrupted in the DB.
+    // last_ping: device heartbeat sent every 5 min — if >10 min old the device is offline.
+    // Convert synced_at → IST (+05:30) in JS after fetching.
     const result = await db.query(`
       SELECT DISTINCT ON (asset_name)
         asset_name,
@@ -86,9 +88,9 @@ app.get('/api/live-temp', async (req, res) => {
         ac_mode,
         ac_power_status,
         ac_fanspeed,
-        ((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes') AS device_timestamp_ist,
         device_status,
         synced_at,
+        last_ping,
         r_phase_power::FLOAT      AS r_phase_power,
         y_phase_power::FLOAT      AS y_phase_power,
         b_phase_power::FLOAT      AS b_phase_power,
@@ -123,19 +125,25 @@ app.get('/api/live-temp', async (req, res) => {
         const yPhasePower = s.y_phase_power ?? 0;
         const bPhasePower = s.b_phase_power ?? 0;
         const totalPhase  = rPhasePower + yPhasePower + bPhasePower;
-        const liveAcOutput = isOn ? (totalPhase > 0 ? totalPhase : (s.power ?? 0)) : 0;
+        // liveAcOutput is zeroed when device is offline (last_ping > 10 min) — stale status
+        // cannot be trusted. Computed after isStale so we can reference it here.
+        const rawAcOutput = isOn ? (totalPhase > 0 ? totalPhase : (s.power ?? 0)) : 0;
 
-        // Staleness check: if device_timestamp is >2 hours old the sensor
-        // has stopped reporting. Flag it so the UI can warn the user.
-        // device_timestamp_ist is already shifted to IST (+05:30) but stored
-        // without timezone, so we compare against current UTC time adjusted.
-        const deviceTsUtc = s.device_timestamp_ist
-          ? new Date(s.device_timestamp_ist).getTime() - (5.5 * 60 * 60 * 1000)
+        // Staleness: device pings every 5 min. If last_ping > 10 min ago → device is offline.
+        // Use last_ping (per DB maintainer guidance) — synced_at can lag due to batch writes.
+        const lastPingMs = s.last_ping ? new Date(s.last_ping).getTime() : null;
+        const ageMinutes = lastPingMs != null
+          ? Math.round((Date.now() - lastPingMs) / 60000)
           : null;
-        const ageMinutes = deviceTsUtc != null
-          ? Math.round((Date.now() - deviceTsUtc) / 60000)
+        const isStale = ageMinutes == null || ageMinutes > 10; // offline if no ping or >10 min
+        // Convert synced_at UTC → IST (+05:30) for display
+        const syncedAtMs = s.synced_at ? new Date(s.synced_at).getTime() : null;
+        const syncedAtIST = s.synced_at
+          ? new Date(syncedAtMs + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 19)
           : null;
-        const isStale = ageMinutes != null && ageMinutes > 120; // >2 hours old
+
+        // If device is offline, AC status cannot be trusted — zero out output
+        const liveAcOutput = isStale ? 0 : rawAcOutput;
 
         return {
           name:            s.asset_name,
@@ -145,15 +153,15 @@ app.get('/api/live-temp', async (req, res) => {
           mode:            s.ac_mode,
           powerStatus:     s.ac_power_status,
           fanSpeed:        s.ac_fanspeed,
-          deviceTimestamp: s.device_timestamp_ist, // already shifted to IST (+05:30)
+          deviceTimestamp: syncedAtIST, // synced_at converted to IST
           status:          s.device_status,
           rPhasePower,
           yPhasePower,
           bPhasePower,
           power:           s.power ?? 0,
           liveAcOutput,
-          ageMinutes,      // how old the reading is in minutes
-          isStale,         // true if >2 hours since device last reported
+          ageMinutes,      // minutes since last_ping
+          isStale,         // true if last_ping > 10 min ago (device offline)
         };
       }),
     });
@@ -183,9 +191,9 @@ app.get('/api/live-all', async (req, res) => {
         ac_mode,
         ac_power_status,
         ac_fanspeed,
-        ((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes') AS device_timestamp_ist,
         device_status,
-        synced_at
+        synced_at,
+        last_ping
       FROM public.lt_bangalore_org_live_device_data
       WHERE site_group_name = ANY($1::text[])
         AND room_temp IS NOT NULL
@@ -204,6 +212,10 @@ app.get('/api/live-all', async (req, res) => {
     const sensors = result.rows.map(s => {
       const naturalZone = dbZoneToAppZone[s.site_group_name] || s.site_group_name;
       const effectiveZone = overrides[s.asset_name] || naturalZone;
+      // Convert synced_at UTC → IST (+05:30) for display
+      const syncedAtIST = s.synced_at
+        ? new Date(new Date(s.synced_at).getTime() + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 19)
+        : null;
       return {
         name:            s.asset_name,
         dbZone:          s.site_group_name,
@@ -214,7 +226,7 @@ app.get('/api/live-all', async (req, res) => {
         mode:            s.ac_mode,
         powerStatus:     s.ac_power_status,
         fanSpeed:        s.ac_fanspeed,
-        deviceTimestamp: s.device_timestamp_ist,
+        deviceTimestamp: syncedAtIST, // synced_at converted to IST
         status:          s.device_status,
       };
     });
@@ -236,7 +248,10 @@ app.get('/api/live-all', async (req, res) => {
 // excludeAssets: sensors to drop from natural dbZones (they were moved elsewhere)
 // includeAssets: sensors to add regardless of their DB site_group_name (they moved here)
 async function getHourlyAvgsForDate(dbZones, date, excludeAssets = [], includeAssets = []) {
-  // Cast to TIMESTAMP first (strips tz info) then add +05:30 to get true IST time
+  // Cast to TIMESTAMP first (strips tz info) then add +05:30 to get true IST time.
+  // last_ping filter: only include readings where the device was actively online
+  // (last_ping within 10 minutes of synced_at). Readings from a powered-off device
+  // that were delayed-synced will have a stale last_ping and are excluded.
   const result = await db.query(`
     SELECT
       EXTRACT(HOUR FROM ((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))::INT AS hour,
@@ -249,6 +264,7 @@ async function getHourlyAvgsForDate(dbZones, date, excludeAssets = [], includeAs
       AND DATE((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes') = $2::DATE
       AND room_temp IS NOT NULL
       AND room_temp::TEXT != 'NaN'
+      AND last_ping >= synced_at - INTERVAL '10 minutes'
     GROUP BY EXTRACT(HOUR FROM ((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))
     ORDER BY hour
   `, [dbZones, date, excludeAssets, includeAssets]);
@@ -260,12 +276,83 @@ async function getHourlyAvgsForDate(dbZones, date, excludeAssets = [], includeAs
   return map;
 }
 
+// ─── Smart gap-filling for hourly temperature arrays ─────────────────────────
+// Handles three distinct gap scenarios produced when office power is off
+// (sensors go silent from ~20:00 to ~07:00):
+//
+//  ┌─────────────────────────────────────────────────────────────────────┐
+//  │  GAP TYPE        │ STRATEGY          │ WHY                         │
+//  ├─────────────────────────────────────────────────────────────────────┤
+//  │ Short (≤ 2 h)    │ Carry-forward     │ Brief glitch; sensor will    │
+//  │                  │                   │ resume same temp             │
+//  ├─────────────────────────────────────────────────────────────────────┤
+//  │ Long, BOTH ends  │ Linear interp.    │ Historical day — we know     │
+//  │ known            │ prev → next       │ where it ended up; straight  │
+//  │                  │                   │ line beats a drifting model  │
+//  ├─────────────────────────────────────────────────────────────────────┤
+//  │ Long, LEFT end   │ Carry-forward 2h  │ Today, real-time — future   │
+//  │ only (today)     │ then null         │ anchor unknown; null → Path B│
+//  │                  │                   │ (physics simulation)         │
+//  └─────────────────────────────────────────────────────────────────────┘
+//
+// Path B (physics engine) handles all nulls — the RC thermal mass model
+// correctly simulates the overnight cool-down from the last known temperature.
+const MAX_GLITCH_HOURS = 2;
+
+function smartFillTemps(temps, hourCeil) {
+  const out = [...temps];
+  let h = 0;
+  while (h <= hourCeil) {
+    if (out[h] !== null) { h++; continue; }
+
+    // Found start of a null run — scan to find its extent
+    const gapStart = h;
+    const prevVal  = gapStart > 0 ? out[gapStart - 1] : null;
+    let   gapEnd   = gapStart;
+    while (gapEnd <= hourCeil && out[gapEnd] === null) gapEnd++;
+    const gapLen  = gapEnd - gapStart;                           // hours of nulls
+    const nextVal = gapEnd <= hourCeil ? out[gapEnd] : null;     // first value after gap
+
+    if (gapLen <= MAX_GLITCH_HOURS) {
+      // ── Short gap: sensor glitch → carry forward ──────────────────────
+      const fill = prevVal ?? nextVal;
+      if (fill !== null)
+        for (let i = gapStart; i < gapEnd; i++) out[i] = fill;
+
+    } else if (prevVal !== null && nextVal !== null) {
+      // ── Long gap, both endpoints known: linear interpolation ──────────
+      // E.g. power off at 20:00 (27°C), back on at 07:00 (25°C) —
+      // interpolate a smooth overnight cool-down curve.
+      for (let i = gapStart; i < gapEnd; i++) {
+        const t   = (i - gapStart + 1) / (gapLen + 1);  // 0…1
+        out[i] = Math.round((prevVal + (nextVal - prevVal) * t) * 100) / 100;
+      }
+
+    } else if (prevVal !== null) {
+      // ── Long gap, left end only (today, real-time): short carry then null ─
+      // Carry forward for MAX_GLITCH_HOURS so minor post-shutdown readings
+      // don't immediately go null; beyond that leave null for Path B.
+      for (let i = gapStart; i < Math.min(gapStart + MAX_GLITCH_HOURS, gapEnd); i++)
+        out[i] = prevVal;
+      // remaining hours in gap stay null → physics engine simulates them
+
+    } else if (nextVal !== null) {
+      // ── Leading gap: backward fill from first known value ─────────────
+      for (let i = gapStart; i < gapEnd; i++) out[i] = nextVal;
+    }
+    // No anchors at all → stays null
+
+    h = gapEnd + 1;
+  }
+  return out;
+}
+
 // ─── GET /api/historical-temp ─────────────────────────────────────────────────
 // Returns a 24-element array (index = hour 0–23) of real sensor avg temps.
 // Fallback priority per hour:
-//   1. Today's avg for that hour
+//   1. Today's avg for that hour (last_ping-filtered — device must have been online)
 //   2. Yesterday's avg for the same hour
-//   3. Carry forward from the nearest previous hour (last resort)
+//   3. Smart gap-fill (see smartFillTemps above) — null for long open-ended gaps
 // Query params: zone (app zone name), date (YYYY-MM-DD, defaults to today IST)
 app.get('/api/historical-temp', async (req, res) => {
   try {
@@ -310,7 +397,7 @@ app.get('/api/historical-temp', async (req, res) => {
     );
     const hourCeil = isQueryingToday ? currentHourIST : 23;
 
-    // Build array: today's real data → yesterday fallback (past hours only) → carry-forward
+    // Build array: today's real data (last_ping-filtered) → yesterday fallback
     const temps = new Array(24).fill(null);
     for (let h = 0; h <= hourCeil; h++) {
       if (todayMap[h] !== undefined) {
@@ -320,29 +407,17 @@ app.get('/api/historical-temp', async (req, res) => {
       }
     }
 
-    // Carry forward for any remaining nulls up to hourCeil (forward pass)
-    let lastKnown = null;
-    for (let h = 0; h <= hourCeil; h++) {
-      if (temps[h] !== null) lastKnown = temps[h];
-      else if (lastKnown !== null) temps[h] = lastKnown;
-    }
-
-    // Backward fill for leading nulls (use first known value, up to hourCeil)
-    const firstKnown = temps.find(t => t !== null);
-    if (firstKnown !== null) {
-      for (let h = 0; h <= hourCeil; h++) {
-        if (temps[h] === null) temps[h] = firstKnown;
-        else break;
-      }
-    }
-    // hours > hourCeil remain null for today — no forecasting
+    // Smart gap-fill: interpolate long gaps where both endpoints are known;
+    // leave trailing nulls (power-off hours with no future anchor) for Path B.
+    const filled = smartFillTemps(temps, hourCeil);
+    // hours > hourCeil remain null — no forecasting into the future
 
     return res.json({
       zone:              appZone,
       dbZones,
       date,
       yesterday,
-      temps,             // null for future hours when querying today
+      temps: filled,     // null for power-off hours with no future anchor → Path B
       hoursFromToday,
       hoursFromYesterday,
       hasData:           hoursFromToday > 0 || hoursFromYesterday > 0,
@@ -359,6 +434,9 @@ app.get('/api/historical-temp', async (req, res) => {
 // device_timestamp is stored as UTC — shift +05:30 to get IST hour/date.
 // excludeAssets / includeAssets: same semantics as getHourlyAvgsForDate
 async function getHourlyAcOutputForDate(dbZones, date, excludeAssets = [], includeAssets = []) {
+  // Use synced_at (reliable UTC) — device_timestamp can be null or corrupted in the DB.
+  // MIN_AC_WATTS: readings below this are fan-only/standby (compressor off, no real cooling).
+  const MIN_AC_WATTS = 50;
   const result = await db.query(`
     SELECT hour, SUM(avg_ac_output)::FLOAT AS total_watts
     FROM (
@@ -368,9 +446,11 @@ async function getHourlyAcOutputForDate(dbZones, date, excludeAssets = [], inclu
         AVG(
           CASE WHEN UPPER(ac_power_status) = 'ON' THEN
             CASE
-              WHEN COALESCE(r_phase_power::FLOAT, 0) + COALESCE(y_phase_power::FLOAT, 0) + COALESCE(b_phase_power::FLOAT, 0) > 0
+              WHEN COALESCE(r_phase_power::FLOAT, 0) + COALESCE(y_phase_power::FLOAT, 0) + COALESCE(b_phase_power::FLOAT, 0) > $5
                 THEN COALESCE(r_phase_power::FLOAT, 0) + COALESCE(y_phase_power::FLOAT, 0) + COALESCE(b_phase_power::FLOAT, 0)
-              ELSE COALESCE(power::FLOAT, 0)
+              WHEN COALESCE(power::FLOAT, 0) > $5
+                THEN COALESCE(power::FLOAT, 0)
+              ELSE 0
             END
           ELSE 0
           END
@@ -382,11 +462,12 @@ async function getHourlyAcOutputForDate(dbZones, date, excludeAssets = [], inclu
       )
         AND LOWER(asset_name) LIKE '%ac%'
         AND DATE((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes') = $2::DATE
+        AND last_ping >= synced_at - INTERVAL '10 minutes'
       GROUP BY EXTRACT(HOUR FROM ((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes')), asset_name
     ) subq
     GROUP BY hour
     ORDER BY hour
-  `, [dbZones, date, excludeAssets, includeAssets]);
+  `, [dbZones, date, excludeAssets, includeAssets, MIN_AC_WATTS]);
 
   const map = {};
   for (const row of result.rows) {
@@ -457,13 +538,15 @@ async function getHourlyAcOutputPerSensorForDate(dbZones, date) {
   const result = await db.query(`
     SELECT
       asset_name,
-      EXTRACT(HOUR FROM ((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))::INT AS hour,
+      EXTRACT(HOUR FROM ((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))::INT AS hour,
       AVG(
         CASE WHEN UPPER(ac_power_status) = 'ON' THEN
           CASE
-            WHEN COALESCE(r_phase_power::FLOAT, 0) + COALESCE(y_phase_power::FLOAT, 0) + COALESCE(b_phase_power::FLOAT, 0) > 0
+            WHEN COALESCE(r_phase_power::FLOAT, 0) + COALESCE(y_phase_power::FLOAT, 0) + COALESCE(b_phase_power::FLOAT, 0) > 50
               THEN COALESCE(r_phase_power::FLOAT, 0) + COALESCE(y_phase_power::FLOAT, 0) + COALESCE(b_phase_power::FLOAT, 0)
-            ELSE COALESCE(power::FLOAT, 0)
+            WHEN COALESCE(power::FLOAT, 0) > 50
+              THEN COALESCE(power::FLOAT, 0)
+            ELSE 0
           END
         ELSE 0
         END
@@ -471,8 +554,9 @@ async function getHourlyAcOutputPerSensorForDate(dbZones, date) {
     FROM public.lt_bangalore_org_live_device_data
     WHERE site_group_name = ANY($1::text[])
       AND LOWER(asset_name) LIKE '%ac%'
-      AND DATE((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes') = $2::DATE
-    GROUP BY asset_name, EXTRACT(HOUR FROM ((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))
+      AND DATE((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes') = $2::DATE
+      AND last_ping >= synced_at - INTERVAL '10 minutes'
+    GROUP BY asset_name, EXTRACT(HOUR FROM ((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))
     ORDER BY asset_name, hour
   `, [dbZones, date]);
 
@@ -571,7 +655,7 @@ app.get('/api/subzones', async (req, res) => {
         )::FLOAT AS avg_ac_watts
       FROM public.lt_bangalore_org_live_device_data
       WHERE site_group_name = ANY($1::text[])
-        AND DATE((device_timestamp::TIMESTAMP) + INTERVAL '5 hours 30 minutes')
+        AND DATE((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes')
             >= (CURRENT_DATE AT TIME ZONE 'Asia/Kolkata') - INTERVAL '7 days'
         AND LOWER(asset_name) LIKE '%ac%'
       GROUP BY site_group_name

@@ -94,6 +94,10 @@ const ResultsDashboard: React.FC<Props> = ({
   // Slice simulation data: today → up to current IST 1-min slot; historical → full 1440 slots
   const chartData = isToday ? results.data.slice(0, currentSlot + 1) : results.data;
 
+  // Office-hours view: only show 10:00 → end of day (pre-10 is unoccupied / off-hours)
+  // Window Gains chart keeps full chartData so sunrise ramp-up is visible.
+  const officeChartData = chartData.filter(d => d.time >= '10:00');
+
   // ── Summary metrics: always computed from elapsed slots only for today.
   // For a past date, use the full-day results from the physics engine.
   // This ensures peak load / AC output never reflect future/forecasted slots.
@@ -120,7 +124,7 @@ const ResultsDashboard: React.FC<Props> = ({
   const acOutputTR = (displayAcOutputAtPeak / 3517).toFixed(2);
   const totalAcKwh = displayTotalAcKwh.toFixed(1);
   const nowLabel  = `${currentISTHour.toString().padStart(2, '0')}:${currentISTMinute.toString().padStart(2, '0')}`;
-  const timeRangeLabel = isToday ? `00:00 → ${nowLabel} IST` : `Full Day (00:00 – 23:55)`;
+  const timeRangeLabel = isToday ? `10:00 → ${nowLabel} IST` : `Office Hours (10:00 – 23:55)`;
 
   // ── Sensor position helpers ───────────────────────────────────────────────
   const isDeskSensor = (sensorName: string): boolean => {
@@ -319,14 +323,15 @@ const ResultsDashboard: React.FC<Props> = ({
     acList
   );
 
-  const processedData: ProcessedDataPoint[] = chartData.map(d => ({
+  const processedData: ProcessedDataPoint[] = officeChartData.map(d => ({
     ...d,
     // Only people + equipment/lighting/appliance — matches what the Configure tab inventory shows
     internalCombined: (d.internalLoad || 0) + (d.peopleLoad || 0),
     // Glass conduction (U×A×ΔT) — envelope load, separate from solar SHGC gain
     glassCondLoad: d.glassLoad || 0,
-    // Inter-zone transfer: only positive (heat flowing in) for the stacked chart; negative = heat leaving
-    zoneTransferLoad: Math.max(0, d.otherLoad || 0),
+    // Inter-zone transfer: include both directions so tooltip components sum to totalHeatLoad.
+    // Positive = heat flowing in from adjacent zone; negative = heat leaving to adjacent zone.
+    zoneTransferLoad: d.otherLoad || 0,
   }));
 
   const areaConfig = [
@@ -336,7 +341,7 @@ const ResultsDashboard: React.FC<Props> = ({
     { key: 'glassCondLoad' as keyof ProcessedDataPoint, name: 'Glass Conduction', color: '#64748b' },
     { key: 'wallLoad' as keyof ProcessedDataPoint, name: 'Wall', color: '#6366f1' },
     { key: 'solarLoad' as keyof ProcessedDataPoint, name: 'Solar', color: '#f59e0b' },
-    { key: 'zoneTransferLoad' as keyof ProcessedDataPoint, name: 'Zone Transfer (in)', color: '#f97316' },
+    { key: 'zoneTransferLoad' as keyof ProcessedDataPoint, name: 'Zone Transfer', color: '#f97316' },
   ];
 
   const activeAreas = areaConfig.filter(cat =>
@@ -836,7 +841,7 @@ const ResultsDashboard: React.FC<Props> = ({
           </div>
           <div className="h-64">
             <ResponsiveContainer width="100%" height="100%">
-              <AreaChart data={chartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
+              <AreaChart data={officeChartData} margin={{ top: 10, right: 10, left: 0, bottom: 0 }}>
                 <defs>
                   <linearGradient id="colorLoad" x1="0" y1="0" x2="0" y2="1">
                     <stop offset="5%" stopColor="#ef4444" stopOpacity={0.3} />
@@ -848,13 +853,13 @@ const ResultsDashboard: React.FC<Props> = ({
                   dataKey="time"
                   stroke="#94a3b8"
                   fontSize={11}
-                  ticks={['00:00','02:00','04:00','06:00','08:00','10:00','12:00','14:00','16:00','18:00','20:00','22:00']}
+                  ticks={['10:00','12:00','14:00','16:00','18:00','20:00','22:00']}
                 />
                 <YAxis
                   stroke="#94a3b8"
                   fontSize={12}
                   label={{ value: 'Watts', angle: -90, position: 'insideLeft', fill: '#94a3b8' }}
-                  domain={[0, 'auto']}
+                  domain={['auto', 'auto']}
                 />
                 <Tooltip content={<CustomTooltip ratedCapacity={ratedCapacityWatts} />} />
                 <Legend />
@@ -881,7 +886,7 @@ const ResultsDashboard: React.FC<Props> = ({
                   dataKey="time"
                   stroke="#94a3b8"
                   fontSize={11}
-                  ticks={['00:00','02:00','04:00','06:00','08:00','10:00','12:00','14:00','16:00','18:00','20:00','22:00']}
+                  ticks={['10:00','12:00','14:00','16:00','18:00','20:00','22:00']}
                 />
                 <YAxis stroke="#94a3b8" fontSize={12} width={45} label={{ value: 'Watts', angle: -90, position: 'insideLeft', fill: '#94a3b8', offset: 0 }} />
                 <Tooltip content={<CustomTooltip />} />
@@ -944,7 +949,7 @@ const ResultsDashboard: React.FC<Props> = ({
             </thead>
             <tbody>
               {/* Show one row per hour (the :00 slot) — keeps table readable at 5-min resolution */}
-              {chartData.filter(d => d.time.endsWith(':00')).map((d, i) => {
+              {officeChartData.filter(d => d.time.endsWith(':00')).map((d, i) => {
                 const load = Math.round(d.totalHeatLoad);
                 const output = Math.round(d.acOutputWatts);
                 const gap = output - load;
@@ -996,7 +1001,7 @@ const ResultsDashboard: React.FC<Props> = ({
 
         {/* Summary footer */}
         {(() => {
-          const activeHours = chartData.filter(d => !(d.totalHeatLoad === 0 && d.acOutputWatts === 0));
+          const activeHours = officeChartData.filter(d => !(d.totalHeatLoad === 0 && d.acOutputWatts === 0));
           const sufficientCount = activeHours.filter(d => d.acOutputWatts >= d.totalHeatLoad).length;
           const undersizedCount = activeHours.length - sufficientCount;
           const totalSlots = activeHours.length;

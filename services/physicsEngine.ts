@@ -17,24 +17,21 @@ export const calculateHeatLoad = (
   internalLoadItems?: InternalLoadItem[],         // optional per-unit inventory; replaces W/m² density method when provided
   adjacentZoneTemps: Record<string, number[]> | null = null,  // zoneId → 24-hr temp array for adjacent zone heat transfer
   initialTempC: number | null = null,             // real starting indoor temp (e.g. yesterday's last sensor reading); overrides the 24°C default
+  previousDayWeather: HourlyWeather | null = null, // yesterday's actual weather — used for pre-warm so wall/roof thermal state reflects true prior-day heat gain
 ): SimulationResult => {
   if (!weather || !weather.temperature) {
     throw new Error("Weather data missing from API.");
   }
 
   // ── Age-based degradation ────────────────────────────────────────────────
-  // Split ACs lose ~2% capacity per year due to refrigerant migration, compressor wear
-  // and coil fouling. Maximum degradation capped at 30% (i.e. floor at 0.70).
-  // Applied to both rated capacity and ISEER (efficiency degrades at the same rate).
   const getAgeFactor = (ageYears: number) => Math.max(0.70, 1 - ageYears * 0.02);
 
   const totalRatedCapacity = acList.reduce(
     (sum, ac) => sum + ac.ratedCapacityWatts * getAgeFactor(ac.ageYears), 0
   );
-  // Weighted-average effective ISEER — used to convert real electrical input → cooling output
   const avgISEER = acList.length > 0
     ? acList.reduce((s, ac) => s + ac.iseer * getAgeFactor(ac.ageYears), 0) / acList.length
-    : 3.70;  // BEE 3-star minimum (3.70–3.99); fallback when no AC units configured
+    : 3.70;
 
   const areaM2 = computeFloorArea(zone.walls);
   const roomVolumeM3 = areaM2 * zone.ceilingHeightM;
@@ -55,9 +52,8 @@ export const calculateHeatLoad = (
   const U_ROOF = 1.5;
   const ALPHA_WALL = 0.6;
   const ALPHA_ROOF = 0.8;
-  const H_OUT_MIN = 10;    // still-air floor (W/m²K)
-  const EPSILON_ROOF = 0.9; // long-wave emissivity — most roofing/wall materials
-  const THERMAL_MASS_FACTOR = 0.7;
+  const H_OUT_MIN = 10;
+  const EPSILON_ROOF = 0.9;
 
   // Infiltration & Internal Gain Constants
   const ACH = 0.5;
@@ -106,138 +102,328 @@ export const calculateHeatLoad = (
     return 0.2;
   };
 
-  // Simulation State — 1-minute resolution (1440 slots per day)
-  // slot 0 = 00:00, slot 1 = 00:01, slot 2 = 00:02, …, slot 1439 = 23:59
+  // ── Wet-bulb temperature (Stull 2011 approximation) ──────────────────────
+  // Valid for RH 5–99 %, T –20 to 50 °C. Used for evaporative cooling on wet
+  // surfaces during rain events.
+  const wetBulb = (T: number, RH: number): number =>
+    T * Math.atan(0.151977 * Math.sqrt(RH + 8.313659))
+    + Math.atan(T + RH)
+    - Math.atan(RH - 1.676331)
+    + 0.00391838 * Math.pow(RH, 1.5) * Math.atan(0.023101 * RH)
+    - 4.686035;
+
+  // ── Simulation State — 1-minute resolution (1440 slots per day) ──────────
+  // slot 0 = 00:00, slot 1 = 00:01, …, slot 1439 = 23:59
+  //
+  // WINDOW SOLAR RTS — radiant delay for solar gain through glass surfaces.
+  // Solar radiation that passes through windows heats room surfaces (desks,
+  // floors, walls) which then re-radiate to room air over 1–5 hours.
+  // RTS = [0.35, 0.25, 0.20, 0.12, 0.08] captures this convective lag.
+  // (This is ASHRAE Step 2 — radiant-to-convective conversion.)
   const RTS = [0.35, 0.25, 0.20, 0.12, 0.08];
-  const wallHistory: number[] = [];
-  const roofHistory: number[] = [];
-  const solarHistory: number[] = [];
+  const solarHistory: number[] = [];   // radiant fraction of window solar gain (70%)
   const data: SimulationDataPoint[] = [];
 
-  // Starting indoor temperature priority:
-  //   1. initialTempC — explicitly supplied (e.g. yesterday's last DB sensor reading)
-  //   2. realIndoorTemps[0] — first hour of today's sensor data (Path A anchor)
-  //   3. 24.0°C hardcoded fallback (worst case — causes systematic cold-start bias)
+  // ── RC Thermal Mass Model for Walls & Roof ────────────────────────────────
+  // ASHRAE Step 1 (Conduction Time Series) requires 18–24 h of wall history to
+  // model overnight heat carry-over. A single-node RC model achieves the same
+  // result without construction-specific lookup tables.
+  //
+  // Wall surface temperature evolves toward the current sol-air temperature
+  // with time constant τ_WALL. By the time 8 hours have passed the wall has
+  // moved ~63 % of the way to the new temperature — so afternoon peak solar
+  // (absorbed by walls 12:00–16:00) is still present as positive wall-to-room
+  // heat transfer well into the night. This matches EnergyPlus's RC model.
+  //
+  // τ_WALL = 8 h = 480 slots (medium-weight concrete/brick construction)
+  // τ_ROOF = 5 h = 300 slots (lighter roof assembly, exposed to sky radiation)
+  const τ_WALL = 480;
+  const τ_ROOF = 300;
+
+  // Starting indoor temperature
   let currentIndoorTemp = initialTempC
     ?? (realIndoorTemps && realIndoorTemps[0] != null ? realIndoorTemps[0] : 24.0);
+
+  // Initialize wall/roof surface temps to outdoor air at 07:00 of the prior day
+  // (before solar warm-up begins). pwWeather is yesterday's weather if available.
+  const pwWeather = previousDayWeather ?? weather;
+  let wallSurfaceTemp = pwWeather.temperature[7] ?? currentIndoorTemp;
+  let roofSurfaceTemp = pwWeather.temperature[7] ?? currentIndoorTemp;
+
   let totalTempSum = 0;
   let maxTemp = 0;
   let peakLoadWatts = 0;
   let peakLoadTime = '';
   let peakPerformanceFactor = 1;
-  let acOutputAtPeakLoad = 0;   // actual AC output (watts) at the slot where peak load occurs
+  let acOutputAtPeakLoad = 0;
 
-  // ── Thermal mass ─────────────────────────────────────────────────────────
-  // Medium-weight construction (concrete frame, screed floor, block/brick walls) —
-  // typical for a Bangalore commercial office building.
-  //   Lightweight (plasterboard / raised floor): ~50,000 J/(m²·K)
-  //   Medium  (concrete frame, block walls):    ~150,000 J/(m²·K)  ← used here
-  //   Heavyweight (exposed concrete / brick):   ~300,000 J/(m²·K)
-  // Used in the energy-balance temperature simulation: ΔT = Q_net × Δt / C
-  const SLOT_SECONDS = 60;                          // 1-minute slot = 60 s
-  const roomThermalMassJperK = areaM2 * 150_000;   // J/K
+  const SLOT_SECONDS = 60;
+  const roomThermalMassJperK = areaM2 * 150_000;
 
-  for (let slot = 0; slot < 1440; slot++) {
-    // Fractional hour: 0, 1/60, 2/60, …, 1439/60 (= 23.983)
-    const fracHour = slot / 60;
-    const h0 = Math.floor(fracHour);                  // integer hour index into weather arrays
-    const h1 = Math.min(h0 + 1, 23);                  // next hour (clamped to 23)
-    const frac = fracHour - h0;                        // 0…0.917 — interpolation weight
-
-    // ── Linearly interpolate all weather values between the two bounding hours ──
-    const lerp = (a: number, b: number) => a * (1 - frac) + b * frac;
-    const outdoorTemp = lerp(weather.temperature[h0],      weather.temperature[h1]);
-    const outdoorRH   = lerp(weather.relativeHumidity[h0], weather.relativeHumidity[h1]);
-    const dni         = lerp(weather.directRadiation[h0],  weather.directRadiation[h1]);
-    const dhi         = lerp(weather.diffuseRadiation[h0], weather.diffuseRadiation[h1]);
-    const ghi         = lerp(weather.shortwaveRadiation[h0], weather.shortwaveRadiation[h1]);
-
-    // ── Dynamic outdoor convection coefficient (ASHRAE McAdams formula) ──────
-    // H_OUT rises with wind speed: faster wind → walls lose/gain heat more rapidly.
-    // During rain/storms wind is typically 5–10 m/s → H_OUT ~25–45 W/m²K vs the
-    // old hardcoded 20.  Falls back to H_OUT_MIN (10) when no wind data available.
-    const windSpeedMs = weather.windspeed
-      ? lerp(weather.windspeed[h0] ?? 3, weather.windspeed[h1] ?? 3)
-      : 3;  // 3 m/s default if API didn't return wind data
-    const H_OUT = Math.max(H_OUT_MIN, 5.8 + 3.94 * windSpeedMs);
-
-    // ── Solar Geometry (use fractional hour for accurate sun position) ──
+  // ── Helper: solar geometry at a given fractional hour ──────────────────
+  const solarGeometry = (fracHour: number) => {
     const H = 15 * (fracHour - 12) * Math.PI / 180;
     const sinAlpha = Math.sin(phi) * Math.sin(delta) + Math.cos(phi) * Math.cos(delta) * Math.cos(H);
     const alpha = Math.asin(Math.max(-1, Math.min(1, sinAlpha)));
-
-    let sunAzimuthDeg = 180;
+    let azimuthDeg = 180;
     if (alpha > -0.01) {
       const cosAz = (Math.sin(delta) - Math.sin(phi) * Math.sin(alpha)) / (Math.cos(phi) * Math.cos(alpha));
       const azRad = Math.acos(Math.max(-1, Math.min(1, cosAz)));
-      sunAzimuthDeg = azRad * 180 / Math.PI;
-      if (H > 0) sunAzimuthDeg = 360 - sunAzimuthDeg;
+      azimuthDeg = azRad * 180 / Math.PI;
+      if (H > 0) azimuthDeg = 360 - azimuthDeg;
+    }
+    return { alpha, azimuthDeg };
+  };
+
+  // ── Pre-warm: RC thermal mass simulation for hours 07:00–23:59 ───────────
+  // Runs the wall/roof RC model through a full 16-hour solar day before the
+  // main midnight-to-midnight simulation. By midnight the surface temperatures
+  // reflect the afternoon solar absorption and evening cool-down, so the main
+  // simulation starts with realistic stored heat in the building envelope.
+  //
+  // When previousDayWeather is provided (yesterday's actual weather fetched
+  // from the API), the pre-warm uses it directly — giving true thermal
+  // continuity across days. A hot sunny Sunday correctly leaves walls warmer
+  // at Monday midnight than a cloudy Sunday would.
+  //
+  // Fallback: if no previous day weather is available, today's own weather is
+  // used as a proxy (ASHRAE periodic steady-state assumption). This is less
+  // accurate but still far better than starting from scratch.
+  //
+  // Rain / evaporative cooling is applied during pre-warm so that a rain
+  // event that started in the afternoon is already reflected in wall/roof
+  // surface temperatures at midnight.
+  const PREWARM_SLOTS = 1020; // 17 hours × 60 min/hour (07:00 → 23:59)
+  // Must be 1020 (not 960) so the RTS 5-step lookback at midnight reads slots
+  // 19:00–23:00 (all zero solar) rather than 18:00–22:00 (18:00 has residual
+  // solar in Bangalore), which was causing phantom solar gain at hour 00:00.
+
+  let prewarmIndoorTemp = currentIndoorTemp;
+
+  for (let ps = 0; ps < PREWARM_SLOTS; ps++) {
+    const fracHourPW = 7 + ps / 60;          // 7.000 … 22.983
+    const h0PW = Math.floor(fracHourPW);      // 7 … 22
+    const h1PW = Math.min(h0PW + 1, 23);
+    const fracPW = fracHourPW - h0PW;
+
+    const lerpPW = (a: number, b: number) => a * (1 - fracPW) + b * fracPW;
+    const outdoorTempPW = lerpPW(pwWeather.temperature[h0PW],      pwWeather.temperature[h1PW]);
+    const outdoorRHPW   = lerpPW(pwWeather.relativeHumidity[h0PW], pwWeather.relativeHumidity[h1PW]);
+    const dniPW  = lerpPW(pwWeather.directRadiation[h0PW],    pwWeather.directRadiation[h1PW]);
+    const dhiPW  = lerpPW(pwWeather.diffuseRadiation[h0PW],   pwWeather.diffuseRadiation[h1PW]);
+    const ghiPW  = lerpPW(pwWeather.shortwaveRadiation[h0PW], pwWeather.shortwaveRadiation[h1PW]);
+    const windPW = pwWeather.windspeed
+      ? lerpPW(pwWeather.windspeed[h0PW] ?? 3, pwWeather.windspeed[h1PW] ?? 3) : 3;
+    const precipPW = pwWeather.precipitation
+      ? lerpPW(pwWeather.precipitation[h0PW] ?? 0, pwWeather.precipitation[h1PW] ?? 0) : 0;
+
+    const H_OUT_PW = Math.max(H_OUT_MIN, 5.8 + 3.94 * windPW);
+    const { alpha: alphaPW, azimuthDeg: sunAzPW } = solarGeometry(fracHourPW);
+
+    // ── Rain / evaporative cooling (upgrade path) ─────────────────────────
+    // When the wall or roof surface is wet (rain or very high humidity),
+    // evaporation cools the outer surface below the dry-bulb outdoor temp.
+    // The effective solair temperature is reduced by the evaporative cooling.
+    //   wetFraction: 0 = dry, 1 = fully saturated surface.
+    //   Wall efficiency 0.6 (vertical surface, partial runoff).
+    //   Roof efficiency 0.9 (horizontal, fully exposed to rain).
+    const isRainingPW = precipPW > 0.1 || (ghiPW < 5 && outdoorRHPW > 88);
+    const wetFrPW = precipPW > 0.1
+      ? Math.min(1, precipPW / 5)
+      : (isRainingPW ? 0.4 : 0);
+    const tWetBulbPW = wetBulb(outdoorTempPW, outdoorRHPW);
+    const evapWallPW = (outdoorTempPW - tWetBulbPW) * 0.6 * wetFrPW;
+    const evapRoofPW = (outdoorTempPW - tWetBulbPW) * 0.9 * wetFrPW;
+
+    // ── Roof RC update ────────────────────────────────────────────────────
+    if (zone.isTopFloor) {
+      const iRoofPW = alphaPW > 0 ? (dniPW * Math.sin(alphaPW) + dhiPW) : 0;
+      const clearSkyPW = alphaPW > 0.05
+        ? Math.min(1, ghiPW / Math.max(1, dniPW * Math.sin(alphaPW) + dhiPW)) : 0;
+      const tSolairRoofPW = outdoorTempPW
+        + (ALPHA_ROOF * iRoofPW / H_OUT_PW)
+        - (EPSILON_ROOF * 63 * clearSkyPW / H_OUT_PW)
+        - evapRoofPW;
+      roofSurfaceTemp += (tSolairRoofPW - roofSurfaceTemp) / τ_ROOF;
     }
 
-    const iRoof = alpha > 0 ? (dni * Math.sin(alpha) + dhi) : 0;
-    // Long-wave sky correction: clear sky radiates ~63 W/m² away from roof (cooling effect).
-    // Under cloud/rain the sky acts as a warm blanket → ΔR → 0.
-    // Use GHI fraction of clear-sky maximum as a cloud proxy (0 = fully overcast, 1 = clear).
-    const clearSkyFraction = alpha > 0.05
-      ? Math.min(1, ghi / Math.max(1, dni * Math.sin(alpha) + dhi))
-      : 0;
-    const deltaR = 63 * clearSkyFraction;
-    const tSolairRoof = outdoorTemp + (ALPHA_ROOF * iRoof / H_OUT) - (EPSILON_ROOF * deltaR / H_OUT);
+    // ── Wall RC update (aggregate tSolair, area-weighted) ─────────────────
+    let tSolairSumPW = 0;
+    let extWallAreaPW = 0;
+    let solarPW = 0; // window solar gain (for solarHistory)
 
-    // Set-point and working hours use integer hour
+    const cosThetaFn = (wallAzimuth: number) =>
+      Math.max(0, Math.cos(alphaPW) * Math.cos(sunAzPW * Math.PI / 180 - wallAzimuth * Math.PI / 180));
+
+    ;(zone.walls || []).forEach(wDef => {
+      if (wDef.wallType === 'internal') return;
+      const totalWallAreaPW = wDef.lengthM * zone.ceilingHeightM;
+
+      if (wDef.constructionType === 'full_glass') {
+        // Window solar gain (goes into solarHistory RTS)
+        const diffusePW  = 0.5 * dhiPW * (1 + Math.sin(alphaPW));
+        const groundPW   = 0.5 * GROUND_REFLECTANCE * ghiPW;
+        const iWinPW = (alphaPW > 0 ? dniPW * cosThetaFn(wDef.azimuth) : 0) + diffusePW + groundPW;
+        solarPW += totalWallAreaPW * FRAME_FACTOR * SHGC * iWinPW;
+      } else {
+        let winAreaPW = 0;
+        if (wDef.constructionType === 'mixed') {
+          (wDef.windows || []).forEach(win => {
+            const diffusePW = 0.5 * dhiPW * (1 + Math.sin(alphaPW));
+            const groundPW  = 0.5 * GROUND_REFLECTANCE * ghiPW;
+            const iWinPW    = (alphaPW > 0 ? dniPW * cosThetaFn(wDef.azimuth) : 0) + diffusePW + groundPW;
+            solarPW  += win.areaM2 * FRAME_FACTOR * SHGC * iWinPW;
+            winAreaPW += win.areaM2;
+          });
+        }
+        const wallNetAreaPW = Math.max(0, totalWallAreaPW - winAreaPW);
+        if (wallNetAreaPW <= 0) return;
+
+        const diffFacPW = 0.5 * (1 + Math.sin(alphaPW));
+        const iWallPW = alphaPW > 0
+          ? (dniPW * cosThetaFn(wDef.azimuth) + diffFacPW * dhiPW + 0.5 * GROUND_REFLECTANCE * ghiPW)
+          : 0;
+        const tSolairWallPW = outdoorTempPW + (ALPHA_WALL * iWallPW / H_OUT_PW) - evapWallPW;
+
+        tSolairSumPW  += tSolairWallPW * wallNetAreaPW;
+        extWallAreaPW += wallNetAreaPW;
+      }
+    });
+
+    if (extWallAreaPW > 0) {
+      wallSurfaceTemp += (tSolairSumPW / extWallAreaPW - wallSurfaceTemp) / τ_WALL;
+    }
+
+    // Window solar radiant fraction → solarHistory (for main-loop RTS)
+    solarHistory.push(0.7 * solarPW);
+
+    // Evolve pre-warm indoor temperature (no occupants, AC off after hours)
+    const hOutPW = getEnthalpy(outdoorTempPW, outdoorRHPW);
+    const hInPWi = getEnthalpy(prewarmIndoorTemp, 50);
+    const qNetPW = massFlowRate * (hOutPW - hInPWi) * 1000
+      + (zone.isTopFloor ? U_ROOF * areaM2 * (roofSurfaceTemp - prewarmIndoorTemp) : 0)
+      + (extWallAreaPW > 0 ? U_WALL * extWallAreaPW * (wallSurfaceTemp - prewarmIndoorTemp) : 0)
+      + 0.3 * solarPW;
+    prewarmIndoorTemp = Math.max(15, Math.min(45, prewarmIndoorTemp + (qNetPW * SLOT_SECONDS) / roomThermalMassJperK));
+  }
+
+  // After pre-warm, reset midnight temperature to real anchor if available;
+  // otherwise use the physics-simulated evening temperature.
+  if (initialTempC == null && !(realIndoorTemps && realIndoorTemps[0] != null)) {
+    currentIndoorTemp = prewarmIndoorTemp;
+  }
+
+  // ── Main simulation: midnight → 23:59 ────────────────────────────────────
+  for (let slot = 0; slot < 1440; slot++) {
+    const fracHour = slot / 60;
+    const h0 = Math.floor(fracHour);
+    const h1 = Math.min(h0 + 1, 23);
+    const frac = fracHour - h0;
+
+    const lerp = (a: number, b: number) => a * (1 - frac) + b * frac;
+    const outdoorTemp = lerp(weather.temperature[h0],       weather.temperature[h1]);
+    const outdoorRH   = lerp(weather.relativeHumidity[h0],  weather.relativeHumidity[h1]);
+    const dni         = lerp(weather.directRadiation[h0],   weather.directRadiation[h1]);
+    const dhi         = lerp(weather.diffuseRadiation[h0],  weather.diffuseRadiation[h1]);
+    const ghi         = lerp(weather.shortwaveRadiation[h0], weather.shortwaveRadiation[h1]);
+    const windSpeedMs = weather.windspeed
+      ? lerp(weather.windspeed[h0] ?? 3, weather.windspeed[h1] ?? 3) : 3;
+    const precipMmH = weather.precipitation
+      ? lerp(weather.precipitation[h0] ?? 0, weather.precipitation[h1] ?? 0) : 0;
+
+    const H_OUT = Math.max(H_OUT_MIN, 5.8 + 3.94 * windSpeedMs);
+
+    // ── Rain / evaporative cooling ────────────────────────────────────────
+    // Detected when precipitation > 0.1 mm/h, OR when solar is essentially
+    // zero combined with very high humidity (cloud/overcast proxy).
+    // wetFraction scales evaporation from partial (0.3) to full (1.0).
+    const isRaining = precipMmH > 0.1 || (ghi < 5 && outdoorRH > 88);
+    const wetFraction = precipMmH > 0.1
+      ? Math.min(1, precipMmH / 5)
+      : (isRaining ? 0.4 : 0);
+    const tWetBulbNow = wetBulb(outdoorTemp, outdoorRH);
+    const evapCoolingWall = (outdoorTemp - tWetBulbNow) * 0.6 * wetFraction;
+    const evapCoolingRoof = (outdoorTemp - tWetBulbNow) * 0.9 * wetFraction;
+
+    // ── Solar geometry ────────────────────────────────────────────────────
+    const { alpha, azimuthDeg: sunAzimuthDeg } = solarGeometry(fracHour);
+
+    // ── Roof solair (with rain evaporative cooling) ───────────────────────
+    const iRoof = alpha > 0 ? (dni * Math.sin(alpha) + dhi) : 0;
+    const clearSkyFraction = alpha > 0.05
+      ? Math.min(1, ghi / Math.max(1, dni * Math.sin(alpha) + dhi)) : 0;
+    const deltaR = 63 * clearSkyFraction;
+    const tSolairRoof = outdoorTemp
+      + (ALPHA_ROOF * iRoof / H_OUT)
+      - (EPSILON_ROOF * deltaR / H_OUT)
+      - evapCoolingRoof;  // rain cools roof surface toward wet-bulb
+
+    // Set-point
     let stepSetPoint = 24;
     if (h0 >= 10 && h0 <= 17) stepSetPoint = 23;
 
     let solar = 0;
     let glass = 0;
-    let wall = 0;
-    let roof = 0;
-    let inf = 0;
+    let wall  = 0;
+    let roof  = 0;
+    let inf   = 0;
     let internalEquipment = 0;
     let people = 0;
-    let other = 0;
+    let other  = 0;
     const slotTransfers: ZoneTransferEntry[] = [];
 
-    // 1. Infiltration Load
+    // 1. Infiltration
     const hOut = getEnthalpy(outdoorTemp, outdoorRH);
     const hInDynamic = getEnthalpy(currentIndoorTemp, 50);
-    const qInf = massFlowRate * (hOut - hInDynamic) * 1000;
-    inf += qInf;
+    inf += massFlowRate * (hOut - hInDynamic) * 1000;
 
-    // 2. Internal Gains — schedule lookup uses integer hour (h0)
+    // 2. Internal Gains
     if (internalLoadItems && internalLoadItems.length > 0) {
-      // ── Inventory / scheduled approach ────────────────────────────────────
       const sched = computeScheduledInternalLoads(internalLoadItems, h0);
       people            += sched.people;
       internalEquipment += sched.lighting + sched.equipment + sched.appliance;
     } else {
-      // ── Density-based fallback (generic W/m²) ────────────────────────────
       const nPeople = maxPeople * getOccupancyFactor(h0);
       people            += nPeople * PEOPLE_TOTAL_HEAT;
       internalEquipment += LIGHTING_DENSITY * areaM2 * getLightingFactor(h0);
       internalEquipment += EQUIPMENT_DENSITY * areaM2 * getEquipmentFactor(h0);
     }
 
-    // 3. Roof (Top Floor only)
+    // 3. Roof — RC thermal mass model
+    // roofSurfaceTemp tracks the actual roof inner-surface temperature,
+    // which lags behind sol-air by τ_ROOF (5 h). After a sunny afternoon
+    // the roof surface stays warm into the night, releasing stored heat.
+    // After rain the surface drops quickly toward wet-bulb, cutting heat gain.
     if (zone.isTopFloor) {
-      const qRoof = U_ROOF * areaM2 * (tSolairRoof - currentIndoorTemp);
-      roof += qRoof;
+      roofSurfaceTemp += (tSolairRoof - roofSurfaceTemp) / τ_ROOF;
+      roof = U_ROOF * areaM2 * (roofSurfaceTemp - currentIndoorTemp);
     }
 
-    // 4. Window Solar Gain & Wall Conduction
+    // 4. Windows (solar gain + glass conduction) and Walls (RC thermal mass)
+    //
+    // Wall thermal mass (RC model — replaces the old 5-step RTS for walls):
+    // wallSurfaceTemp tracks the wall inner-surface temperature with an 8 h
+    // time constant. During the day it climbs toward the (high) sol-air temp;
+    // at night it decays slowly — so at midnight it is still warmer than indoor
+    // air, producing a POSITIVE heat flow INTO the room (stored afternoon heat).
+    // This matches the physical "flywheel" effect of concrete/brick walls.
+    //
+    // Rain: evapCoolingWall reduces the effective solair, pulling wallSurfaceTemp
+    // down toward wet-bulb. With τ = 8 h the drop is gradual, not instant.
+    let tSolairWeightedSum = 0;
+    let totalExtWallArea   = 0;
+
     const walls = zone.walls || [];
     const hourWindowGains: Record<string, number> = {};
     const hourWindowDebug: Record<string, { azimuth: number; cosTheta: number; incidentRadiation: number; solarGain: number }> = {};
 
     walls.forEach(wDef => {
       if (wDef.wallType === 'internal') {
-        // Heat conduction through shared partition into/from the adjacent zone
         if (adjacentZoneTemps && wDef.adjacentZoneId) {
           const adjTemps = adjacentZoneTemps[wDef.adjacentZoneId];
           if (adjTemps) {
             const adjTemp = adjTemps[h0] ?? currentIndoorTemp;
             const totalArea = wDef.lengthM * zone.ceilingHeightM;
-            // Weighted U-value: split wall into glass and opaque portions using measured glassAreaM2
             let uEffective: number;
             if (wDef.constructionType === 'full_glass') {
               uEffective = U_GLASS;
@@ -246,11 +432,10 @@ export const calculateHeatLoad = (
               const opaqueArea = Math.max(0, totalArea - glassArea);
               uEffective = (U_GLASS * glassArea + U_WALL * opaqueArea) / totalArea;
             } else if (wDef.constructionType === 'mixed') {
-              uEffective = (U_WALL + U_GLASS) / 2;  // fallback: no glassAreaM2 provided
+              uEffective = (U_WALL + U_GLASS) / 2;
             } else {
               uEffective = U_WALL;
             }
-            // Positive → heat flowing into this zone (adjacent is hotter); negative → heat leaving
             const transferWatts = uEffective * totalArea * (adjTemp - currentIndoorTemp);
             other += transferWatts;
             slotTransfers.push({ wallId: wDef.id, adjacentZoneId: wDef.adjacentZoneId!, watts: transferWatts });
@@ -266,7 +451,7 @@ export const calculateHeatLoad = (
         const gammaW = wDef.azimuth * Math.PI / 180;
         const cosTheta = Math.max(0, Math.cos(alpha) * Math.cos(gammaS - gammaW));
         const diffuseComponent = 0.5 * dhi * (1 + Math.sin(alpha));
-        const groundComponent = 0.5 * GROUND_REFLECTANCE * ghi;
+        const groundComponent  = 0.5 * GROUND_REFLECTANCE * ghi;
         const iWin = (alpha > 0 ? dni * cosTheta : 0) + diffuseComponent + groundComponent;
 
         const qSolar = totalWallArea * FRAME_FACTOR * SHGC * iWin;
@@ -288,7 +473,6 @@ export const calculateHeatLoad = (
             const cosTheta = Math.max(0, Math.cos(alpha) * Math.cos(gammaS - gammaW));
             const groundComponent = 0.5 * GROUND_REFLECTANCE * ghi;
 
-            // Obstruction: block direct solar + reduce diffuse via Sky View Factor
             let obstrAngleDeg = 0;
             let svf = 1.0;
             if (win.obstructionHeightM != null && win.obstructionDistanceM != null && win.obstructionDistanceM > 0) {
@@ -296,16 +480,15 @@ export const calculateHeatLoad = (
               svf = (1 + Math.cos(obstrAngleDeg * Math.PI / 180)) / 2;
             }
 
-            // If obstruction width given, compute azimuth half-angle; default to full 180° frontal blocking
             const obstrAzHalf = (win.obstructionWidthM != null && win.obstructionDistanceM != null && win.obstructionDistanceM > 0)
               ? Math.atan2(win.obstructionWidthM / 2, win.obstructionDistanceM) * 180 / Math.PI
-              : 90; // full frontal coverage if width not given
+              : 90;
 
             const sunFacingWall = Math.abs(sunAzimuthDeg - wDef.azimuth) <= 90 || Math.abs(sunAzimuthDeg - wDef.azimuth) >= 270;
             const sunInObstrCone = sunFacingWall && Math.abs(((sunAzimuthDeg - wDef.azimuth) + 360) % 360 - 180) <= obstrAzHalf;
 
             const directBlocked = obstrAngleDeg > 0 && (alpha * 180 / Math.PI) < obstrAngleDeg && sunInObstrCone;
-            const directComponent = (alpha > 0 && !directBlocked) ? dni * cosTheta : 0;
+            const directComponent  = (alpha > 0 && !directBlocked) ? dni * cosTheta : 0;
             const diffuseEffective = 0.5 * dhi * (1 + Math.sin(alpha)) * svf;
             const iWin = directComponent + diffuseEffective + groundComponent;
 
@@ -321,89 +504,73 @@ export const calculateHeatLoad = (
           });
         }
 
+        // Accumulate opaque wall area and solair for RC model
         const wallNetArea = Math.max(0, totalWallArea - totalWindowAreaOnWall);
-        const gammaS_wall = sunAzimuthDeg * Math.PI / 180;
-        const gammaW_wall = wDef.azimuth * Math.PI / 180;
-        const cosThetaWall = Math.max(0, Math.cos(alpha) * Math.cos(gammaS_wall - gammaW_wall));
-        const diffuseFactor = 0.5 * (1 + Math.sin(alpha));
-        const iWall = alpha > 0 ? (dni * cosThetaWall + diffuseFactor * dhi + 0.5 * GROUND_REFLECTANCE * ghi) : 0;
+        if (wallNetArea > 0) {
+          const gammaS_wall = sunAzimuthDeg * Math.PI / 180;
+          const gammaW_wall = wDef.azimuth * Math.PI / 180;
+          const cosThetaWall  = Math.max(0, Math.cos(alpha) * Math.cos(gammaS_wall - gammaW_wall));
+          const diffuseFactor = 0.5 * (1 + Math.sin(alpha));
+          const iWall = alpha > 0
+            ? (dni * cosThetaWall + diffuseFactor * dhi + 0.5 * GROUND_REFLECTANCE * ghi)
+            : 0;
+          // Apply evaporative cooling to effective solair when wall surface is wet
+          const tSolairWall = outdoorTemp + (ALPHA_WALL * iWall / H_OUT) - evapCoolingWall;
 
-        const tSolair = outdoorTemp + (ALPHA_WALL * iWall / H_OUT);
-        const qWall = THERMAL_MASS_FACTOR * U_WALL * wallNetArea * (tSolair - currentIndoorTemp);
-        wall += qWall;
+          tSolairWeightedSum += tSolairWall * wallNetArea;
+          totalExtWallArea   += wallNetArea;
+        }
       }
     });
 
-    // ── RTS — radiant delays in 1-hour steps (= 60 slots at 1-min resolution) ─
-    const convectiveSolar = 0.3 * solar;
-    const radiantSolar = 0.7 * solar;
-    solarHistory.push(radiantSolar);
-    wallHistory.push(wall);
-    roofHistory.push(roof);
-
-    let solarDelayed = convectiveSolar;
-    let wallDelayed = 0;
-    let roofDelayed = 0;
-    for (let i = 0; i < RTS.length; i++) {
-      // Each delay step is 60 slots (= 1 hour) to preserve the hourly RTS physics
-      solarDelayed += RTS[i] * (solarHistory[slot - (i + 1) * 60] || 0);
-      wallDelayed  += RTS[i] * (wallHistory[slot - i * 60]          || 0);
-      roofDelayed  += RTS[i] * (roofHistory[slot - i * 60]          || 0);
+    // ── RC update: wall surface temperature → wall heat to room ──────────
+    if (totalExtWallArea > 0) {
+      const tSolairAvg = tSolairWeightedSum / totalExtWallArea;
+      wallSurfaceTemp += (tSolairAvg - wallSurfaceTemp) / τ_WALL;
+      wall = U_WALL * totalExtWallArea * (wallSurfaceTemp - currentIndoorTemp);
     }
 
-    const currentTotalLoad = solarDelayed + glass + wallDelayed + roofDelayed + inf + internalEquipment + people + other;
+    // ── Window solar: RTS converts radiative fraction to cooling load ─────
+    // (ASHRAE Step 2 — unchanged; only glass solar uses RTS, not walls)
+    const convectiveSolar = 0.3 * solar;
+    const radiantSolar    = 0.7 * solar;
+    solarHistory.push(radiantSolar);  // grows to PREWARM_SLOTS + 1440 entries
 
-    // ── AC Capacity ──────────────────────────────────────────────────────────
+    let solarDelayed = convectiveSolar;
+    for (let i = 0; i < RTS.length; i++) {
+      solarDelayed += RTS[i] * (solarHistory[PREWARM_SLOTS + slot - (i + 1) * 60] || 0);
+    }
+
+    const currentTotalLoad = solarDelayed + glass + wall + roof + inf + internalEquipment + people + other;
+
+    // ── AC Capacity ───────────────────────────────────────────────────────
     const degradation = Math.max(0, (outdoorTemp - 35) * 0.015);
     const performanceFactor = 1 - degradation;
     const isWorkingHours = h0 >= 8 && h0 <= 20;
     const acActive = isWorkingHours || currentTotalLoad > 500;
     const maxAvailableCapacity = acActive ? (totalRatedCapacity * performanceFactor) : 0;
 
-    // ── AC output (display / verdict) ────────────────────────────────────────
-    // Uses real sensor data only: electrical watts from DB × avgISEER = cooling watts.
-    // If no real data for this hour the AC is considered OFF for reporting → 0.
-    // Uses real sensor data only: electrical watts from DB × avgISEER = cooling watts.
-    // If no real data for this hour the AC is considered OFF for reporting → 0.
-    const acOutputEst = (realAcOutputsWatts && realAcOutputsWatts[h0] != null && realAcOutputsWatts[h0] > 0)
+    const MIN_MEANINGFUL_AC_WATTS = 50;
+    const acOutputEst = (realAcOutputsWatts && realAcOutputsWatts[h0] != null && realAcOutputsWatts[h0] >= MIN_MEANINGFUL_AC_WATTS)
       ? realAcOutputsWatts[h0] * avgISEER
       : 0;
 
-    // ── Thermal Simulation (energy balance + thermal mass) ───────────────────
-    // ΔT = Q_net × Δt / C
-    //   Q_net       = heat flowing INTO the room this slot (watts)
-    //                 = total heat gain − AC cooling removed
-    //   Δt          = SLOT_SECONDS (60 s for 1-min slot)
-    //   C           = roomThermalMassJperK (J/K) — concrete construction
-    //
-    // For the AC cooling term we use:
-    //   • Real sensor data (acOutputEst) when available — most accurate.
-    //   • Estimated from capacity when no real data: AC removes up to
-    //     maxAvailableCapacity, limited by how much load exists.
-    //     This avoids runaway heating in the simulated (no-data) path.
-    //
-    // Real DB data arrays are 24-element (hourly); use h0 as index for both
-    // the :00 and :30 slot within that hour.
+    // ── Thermal Simulation ────────────────────────────────────────────────
     let nextTemp: number;
     if (realIndoorTemps && realIndoorTemps[h0] != null) {
-      // ── Path A: sensor data available — interpolate between hourly readings ──
       const t0 = realIndoorTemps[h0];
       const t1 = realIndoorTemps[Math.min(h0 + 1, 23)] ?? t0;
       nextTemp = t0 * (1 - frac) + t1 * frac;
     } else {
-      // ── Path B: no sensor data — physics simulation ───────────────────────
-      // Cooling removed this slot: prefer real AC output, else capacity estimate.
       const acCoolingThisSlot = acOutputEst > 0
-        ? acOutputEst                                             // real watts × ISEER
-        : (acActive ? Math.min(currentTotalLoad, maxAvailableCapacity) : 0); // estimated
+        ? acOutputEst
+        : (acActive ? Math.min(currentTotalLoad, maxAvailableCapacity) : 0);
 
-      const qNet   = currentTotalLoad - acCoolingThisSlot;       // net watts into room
-      const deltaT = (qNet * SLOT_SECONDS) / roomThermalMassJperK; // °C change this slot
+      const qNet   = currentTotalLoad - acCoolingThisSlot;
+      const deltaT = (qNet * SLOT_SECONDS) / roomThermalMassJperK;
       nextTemp = currentIndoorTemp + deltaT;
 
-      // Thermostat guard: AC cannot cool below setpoint−1°C (compressor cycles off)
       if (acActive && nextTemp < stepSetPoint - 1) nextTemp = stepSetPoint - 1;
-      // Physical bounds: dew point floor ~15°C; extreme heat ceiling ~45°C
       nextTemp = Math.max(15, Math.min(45, nextTemp));
     }
 
@@ -424,8 +591,8 @@ export const calculateHeatLoad = (
       outdoorTemp,
       solarLoad: solarDelayed,
       glassLoad: glass,
-      wallLoad: wallDelayed,
-      roofLoad: roofDelayed,
+      wallLoad: wall,
+      roofLoad: roof,
       infLoad: inf,
       internalLoad: internalEquipment,
       peopleLoad: people,
@@ -447,10 +614,7 @@ export const calculateHeatLoad = (
     });
   }
 
-  // Verdict: real AC output at the peak load slot vs the peak load (real data only).
   const isSufficient = acOutputAtPeakLoad >= peakLoadWatts;
-
-  // Total daily AC cooling energy: sum of 1-min slot outputs × (1/60) h ÷ 1000 → kWh
   const totalDailyAcKwh = data.reduce((sum, d) => sum + d.acOutputWatts / 60 / 1000, 0);
 
   return {
@@ -458,7 +622,7 @@ export const calculateHeatLoad = (
     peakLoadWatts,
     peakLoadTime,
     isSufficient,
-    averageTemp: totalTempSum / 1440,  // 1440 slots per day
+    averageTemp: totalTempSum / 1440,
     maxTemp,
     acOutputAtPeakLoad,
     totalDailyAcKwh,

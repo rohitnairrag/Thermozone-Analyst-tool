@@ -261,6 +261,7 @@ function App() {
     return { name: 'Bangalore, India', lat: 12.9716, lon: 77.5946 };
   });
   const [weather, setWeather] = useState<HourlyWeather | null>(null);
+  const [previousDayWeather, setPreviousDayWeather] = useState<HourlyWeather | null>(null);
   const [isFetchingWeather, setIsFetchingWeather] = useState(false);
   const [locationInput, setLocationInput] = useState(location.name);
 
@@ -405,9 +406,18 @@ function App() {
     const loadWeather = async () => {
       setIsFetchingWeather(true);
       setWeatherError(null);
-      const data = await fetchWeatherForDate(location.lat, location.lon, selectedDate);
+      // Compute previous day (for pre-warm thermal continuity)
+      const prevDate = new Date(selectedDate + 'T12:00:00Z');
+      prevDate.setUTCDate(prevDate.getUTCDate() - 1);
+      const previousDateStr = prevDate.toISOString().slice(0, 10);
+      // Fetch both days in parallel — prev day used only for pre-warm wall/roof state
+      const [data, prevData] = await Promise.all([
+        fetchWeatherForDate(location.lat, location.lon, selectedDate),
+        fetchWeatherForDate(location.lat, location.lon, previousDateStr),
+      ]);
       if (data) {
         setWeather(data);
+        setPreviousDayWeather(prevData);   // null if fetch failed — engine falls back gracefully
       } else {
         setWeatherError("Failed to fetch weather data. Please check the location or try again.");
       }
@@ -433,7 +443,13 @@ function App() {
       const adjZoneTemps = Object.keys(allZoneTemps).length > 0
         ? Object.fromEntries(Object.entries(allZoneTemps).filter(([id]) => id !== (activeZoneId || zones[0]?.id))) as Record<string, number[]>
         : null;
-      const res = calculateHeatLoad(zone, acList, weather, location.lat, location.lon, realTemps, realAcOutputs, inventoryItems, adjZoneTemps);
+      // Initial indoor temp: use midnight sensor reading if available, otherwise derive from
+      // midnight outdoor temp + 2°C indoor offset (more realistic than the 24°C hardcoded fallback,
+      // especially in Bangalore where overnight temps can be 26–30°C in summer).
+      const initialTempC = realTemps?.[0] != null
+        ? realTemps[0]
+        : (weather.temperature[0] != null ? weather.temperature[0] + 2 : null);
+      const res = calculateHeatLoad(zone, acList, weather, location.lat, location.lon, realTemps, realAcOutputs, inventoryItems, adjZoneTemps, initialTempC, previousDayWeather);
       setResults(res);
       setWeatherError(null);
     } catch (error) {
@@ -443,7 +459,7 @@ function App() {
   // allZoneTemps is intentionally included: when adjacent zone temperatures arrive
   // (async, after first render) the simulation must re-run so zoneTransfers are populated.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [zone, acList, weather, location, historicalTemps, historicalAcOutput, activeProfile?.internalLoads, allZoneTemps]);
+  }, [zone, acList, weather, previousDayWeather, location, historicalTemps, historicalAcOutput, activeProfile?.internalLoads, allZoneTemps]);
 
   // Compute simulation for ALL zones using shared weather — makes heat flow diagram zone-independent
   useEffect(() => {
@@ -463,10 +479,13 @@ function App() {
         const zoneAcOutputs = (allZoneAcOutputs[zp.id] && allZoneAcOutputs[zp.id].length > 0)
           ? allZoneAcOutputs[zp.id]
           : null;
+        const zoneInitialTemp = (zoneSensorTemps?.[0] != null)
+          ? zoneSensorTemps[0]
+          : (weather.temperature[0] != null ? weather.temperature[0] + 2 : null);
         computed[zp.id] = calculateHeatLoad(
           zp.zone, zp.ac, weather, location.lat, location.lon,
           zoneSensorTemps, zoneAcOutputs,
-          zp.internalLoads, adjTemps
+          zp.internalLoads, adjTemps, zoneInitialTemp, previousDayWeather
         );
       } catch (e) {
         console.warn(`[allZoneResults] sim failed for zone ${zp.id}:`, e);
