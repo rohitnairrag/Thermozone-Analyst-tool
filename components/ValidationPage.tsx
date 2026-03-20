@@ -152,8 +152,12 @@ export default function ValidationPage() {
       // the model runs too cold all day. Using the real end-of-yesterday temp fixes this.
       setStatus('Fetching yesterday\'s sensor data for starting temperature…');
       const prevDate = (() => {
-        const d = new Date(date); d.setDate(d.getDate() - 1);
-        return d.toISOString().slice(0, 10);
+        const [y, m, d] = date.split('-').map(Number);
+        const prev = new Date(y, m - 1, d - 1);   // local date, no UTC conversion
+        const yy = prev.getFullYear();
+        const mm = String(prev.getMonth() + 1).padStart(2, '0');
+        const dd = String(prev.getDate()).padStart(2, '0');
+        return `${yy}-${mm}-${dd}`;
       })();
       const prevTempsData = await fetchHistoricalTemps(zoneName, prevDate);
       const initialTempC = prevTempsData?.hasData
@@ -327,7 +331,7 @@ export default function ValidationPage() {
               ● AC Power: {acNote}
             </span>
             <span className="px-3 py-1 bg-purple-950/40 border border-purple-800/50 text-purple-400 rounded-full">
-              ● Physics: 1-min timestep · Path B (no sensor temps fed in)
+              ● Physics: 30-min timestep · Path B (no sensor temps fed in)
             </span>
             <span className={`px-3 py-1 border rounded-full ${startTempNote.includes('real sensor') ? 'bg-teal-950/40 border-teal-800/50 text-teal-400' : 'bg-amber-950/40 border-amber-800/50 text-amber-400'}`}>
               ● T₀: {startTempNote}

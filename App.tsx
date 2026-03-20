@@ -788,25 +788,26 @@ function App() {
   };
 
   // --- Sensor Zone Override Handlers ---
-  const moveSensor = (assetName: string, toZone: string | null) => {
+  // key = compound "dbZone::sensorName" — uniquely identifies a sensor across all DB zones
+  const moveSensor = (key: string, toZone: string | null) => {
     const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
     setSensorZoneOverrides(prev => {
       const next = { ...prev };
       if (toZone === null) {
-        delete next[assetName]; // reset — removes all move history for this sensor
+        delete next[key]; // reset — removes all move history for this sensor
       } else {
-        const existing = next[assetName] || [];
+        const existing = next[key] || [];
         // Replace any existing entry for today (idempotent if user changes dropdown multiple times today)
         const filtered = existing.filter(e => e.from !== todayIST);
-        next[assetName] = [...filtered, { zone: toZone, from: todayIST }];
+        next[key] = [...filtered, { zone: toZone, from: todayIST }];
       }
       return next;
     });
   };
 
   // Helper: get the currently effective zone for a sensor (most recent entry ≤ today)
-  const effectiveZoneForSensor = (assetName: string, naturalZone: string): string => {
-    const entries = sensorZoneOverrides[assetName];
+  const effectiveZoneForSensor = (key: string, naturalZone: string): string => {
+    const entries = sensorZoneOverrides[key];
     if (!entries || entries.length === 0) return naturalZone;
     const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
     const applicable = entries
@@ -1214,17 +1215,7 @@ function App() {
               <div>
                 <p className="text-xs text-slate-400 uppercase tracking-wider">
                   Zone Temp
-                  {liveData && (() => {
-                    const maxAge = Math.max(...liveData.sensors.map(s => s.ageMinutes ?? 0));
-                    const anyStale = liveData.sensors.some(s => s.isStale);
-                    if (anyStale) return (
-                      <span className="ml-2 text-amber-400 normal-case font-normal"
-                        title={`Sensor data is ${Math.round(maxAge / 60)}h old — device may have stopped reporting`}>
-                        ⚠ Stale ({Math.round(maxAge / 60)}h old)
-                      </span>
-                    );
-                    return <span className="ml-2 text-green-400 normal-case font-normal">● Live</span>;
-                  })()}
+                  {liveData && <span className="ml-2 text-green-400 normal-case font-normal">● Live</span>}
                   {!liveData && <span className="ml-2 text-slate-500 normal-case font-normal">No sensor data</span>}
                   {deskAvgTemp != null && <span className="ml-2 text-cyan-400 normal-case font-normal">· desk sensors</span>}
                   {historicalTemps?.hasData && <span className="ml-2 text-blue-400 normal-case font-normal">· DB temps active</span>}
@@ -1859,7 +1850,12 @@ function App() {
               {/* ── SENSOR ZONES SECTION ── */}
               {configSection === 'sensors' && (() => {
                 const allZoneNames = zones.map(z => z.zone.name);
+                const zoneDisplayName = Object.fromEntries(zones.map(z => [z.zone.name, z.zone.displayName || z.zone.name]));
                 const sensors = allLiveSensors?.sensors ?? [];
+                // dbZoneToAppZone: e.g. { "Working Area 1": "Zone 1", "Pantry 1": "Zone 2" }
+                const dbZoneToAppZone = allLiveSensors?.dbZoneToAppZone ?? {};
+                // All available DB subzones, grouped by their app zone for display
+                const allDbZones = Object.keys(dbZoneToAppZone);
 
                 return (
                   <div className="space-y-6">
@@ -1890,14 +1886,15 @@ function App() {
                         </div>
 
                         {sensors.map(s => {
-                          const entries = sensorZoneOverrides[s.name] || [];
-                          const isOverridden = entries.length > 0;
-                          const currentZone = effectiveZoneForSensor(s.name, s.naturalZone);
-                          const latestEntry = entries.sort((a, b) => b.from.localeCompare(a.from))[0];
+                          const entries = sensorZoneOverrides[s.key] || [];
+                          // effectiveDbZone = where the sensor is currently assigned (DB zone name)
+                          const effectiveDbZone = effectiveZoneForSensor(s.key, s.dbZone);
+                          const isOverridden = effectiveDbZone !== s.dbZone;
+                          const latestEntry = [...entries].sort((a, b) => b.from.localeCompare(a.from))[0];
 
                           return (
                             <div
-                              key={s.name}
+                              key={s.key}
                               className={`grid grid-cols-12 gap-2 items-center px-3 py-2.5 rounded-xl border ${
                                 isOverridden ? 'bg-amber-950/20 border-amber-700/40' : 'bg-slate-800/50 border-slate-700/50'
                               }`}
@@ -1911,24 +1908,26 @@ function App() {
                                 )}
                               </div>
 
-                              {/* DB zone */}
+                              {/* Original DB zone (physical home) */}
                               <div className="col-span-3">
                                 <p className="text-xs text-slate-400 leading-tight">{s.dbZone}</p>
-                                <p className="text-[10px] text-slate-500">({s.naturalZone})</p>
+                                <p className="text-[10px] text-slate-500">({zoneDisplayName[s.naturalZone] ?? s.naturalZone})</p>
                               </div>
 
-                              {/* Zone selector */}
+                              {/* Subzone selector — picks target DB zone */}
                               <div className="col-span-4">
                                 <select
-                                  value={currentZone}
+                                  value={effectiveDbZone}
                                   onChange={e => {
                                     const chosen = e.target.value;
-                                    moveSensor(s.name, chosen === s.naturalZone && entries.length === 0 ? null : chosen);
+                                    moveSensor(s.key, chosen === s.dbZone ? null : chosen);
                                   }}
                                   className="w-full bg-slate-900 border border-slate-600 text-white text-xs rounded-lg px-2 py-1.5 focus:outline-none focus:border-blue-500"
                                 >
-                                  {allZoneNames.map(zn => (
-                                    <option key={zn} value={zn}>{zn}</option>
+                                  {allDbZones.map(dz => (
+                                    <option key={dz} value={dz}>
+                                      {dz} ({zoneDisplayName[dbZoneToAppZone[dz]] ?? dbZoneToAppZone[dz]})
+                                    </option>
                                   ))}
                                 </select>
                               </div>
@@ -1937,7 +1936,7 @@ function App() {
                               <div className="col-span-1 flex justify-center">
                                 {isOverridden && (
                                   <button
-                                    onClick={() => moveSensor(s.name, null)}
+                                    onClick={() => moveSensor(s.key, null)}
                                     title="Reset to DB zone (clear all move history)"
                                     className="text-slate-500 hover:text-red-400 transition-colors"
                                   >
@@ -2004,7 +2003,7 @@ function App() {
                   isToday={isToday}
                   acOutputSource={historicalAcOutput ? {
                     hasData: historicalAcOutput.hasData,
-                    hoursWithAcOn: historicalAcOutput.acOutputs.filter((v): v is number => v != null && v > 0).length,
+                    hoursWithAcOn: historicalAcOutput.acOutputs.filter((v): v is number => v != null && v > 100).length,
                     hoursFromYesterday: historicalAcOutput.hoursFromYesterday,
                     totalElecKwh: historicalAcOutput.acOutputs
                       .filter((v): v is number => v !== null)

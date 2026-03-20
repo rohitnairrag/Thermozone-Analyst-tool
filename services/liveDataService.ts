@@ -9,6 +9,7 @@
 
 /** A sensor reading returned by /api/live-all — includes naturalZone and effectiveZone */
 export interface AllSensorReading {
+  key: string;             // compound unique id: "dbZone::sensorName"
   name: string;
   dbZone: string;          // DB site_group_name (physical home)
   naturalZone: string;     // app zone derived from ZONE_MAP
@@ -29,8 +30,9 @@ export interface SensorMoveEntry {
 
 export interface AllSensorsData {
   sensors: AllSensorReading[];
-  overrides: Record<string, SensorMoveEntry[]>;  // assetName → timestamped move history
+  overrides: Record<string, SensorMoveEntry[]>;  // compound key → timestamped move history
   zones: string[];                               // all known app zone names
+  dbZoneToAppZone: Record<string, string>;       // DB subzone → parent app zone name
 }
 
 export interface SensorReading {
