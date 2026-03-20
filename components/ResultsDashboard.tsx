@@ -329,8 +329,9 @@ const ResultsDashboard: React.FC<Props> = ({
     internalCombined: (d.internalLoad || 0) + (d.peopleLoad || 0),
     // Glass conduction (U×A×ΔT) — envelope load, separate from solar SHGC gain
     glassCondLoad: d.glassLoad || 0,
-    // Inter-zone transfer: only positive (heat flowing in) for the stacked chart; negative = heat leaving
-    zoneTransferLoad: Math.max(0, d.otherLoad || 0),
+    // Inter-zone transfer: include both directions so tooltip components sum to totalHeatLoad.
+    // Positive = heat flowing in from adjacent zone; negative = heat leaving to adjacent zone.
+    zoneTransferLoad: d.otherLoad || 0,
   }));
 
   const areaConfig = [
@@ -340,7 +341,7 @@ const ResultsDashboard: React.FC<Props> = ({
     { key: 'glassCondLoad' as keyof ProcessedDataPoint, name: 'Glass Conduction', color: '#64748b' },
     { key: 'wallLoad' as keyof ProcessedDataPoint, name: 'Wall', color: '#6366f1' },
     { key: 'solarLoad' as keyof ProcessedDataPoint, name: 'Solar', color: '#f59e0b' },
-    { key: 'zoneTransferLoad' as keyof ProcessedDataPoint, name: 'Zone Transfer (in)', color: '#f97316' },
+    { key: 'zoneTransferLoad' as keyof ProcessedDataPoint, name: 'Zone Transfer', color: '#f97316' },
   ];
 
   const activeAreas = areaConfig.filter(cat =>

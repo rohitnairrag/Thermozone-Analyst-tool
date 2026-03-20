@@ -60,7 +60,8 @@ export interface HourlyWeather {
   diffuseRadiation: number[];
   shortwaveRadiation: number[];
   relativeHumidity: number[];
-  windspeed?: number[];   // 10m wind speed in m/s — used for dynamic outdoor convection coefficient
+  windspeed?: number[];      // 10m wind speed in m/s — used for dynamic outdoor convection coefficient
+  precipitation?: number[];  // mm/h — used for evaporative cooling on wet wall/roof surfaces during rain
 }
 
 export interface LocationData {
