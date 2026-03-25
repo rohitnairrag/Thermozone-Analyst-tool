@@ -1,17 +1,18 @@
 /**
  * FloorPlanEditor.tsx
  *
- * Full-office interactive 2-D floor plan editor.
+ * Interactive floor plan editor.
  *
  * Features
  * ─────────
- * • Renders all zone polygons from wall-vector definitions (SVG)
- * • Click any wall → edit its length in metres; add or delete walls via toolbar
- * • Drag zones to reposition them on the canvas
- * • Left sidebar lists all sensors (desk / ceiling) for the selected zone;
- *   drag them onto the canvas to set their position
- * • Ceiling sensors also act as AC anchors: after dropping one, pick airflow direction
- * • Click a placed sensor → right detail panel shows hot-pocket metrics
+ * • Upload any draw.io / SVG floor plan — displayed as-is (unchanged visual)
+ * • Wall segments auto-extracted from the SVG mxGraph XML; each wall is a
+ *   clickable hit-target overlaid on the image (hover = highlight + dimension,
+ *   click = edit length in metres)
+ * • Drag live DB sensors from the left sidebar onto the floor plan to place them
+ * • Multiple sensors persist (functional-updater pattern, no stale closure)
+ * • Click a placed sensor → right panel shows live temp, hot-pocket score,
+ *   X/Y distance to nearest AC, role selector, remove button
  * • "Show Heatmap" toggle renders an IDW gradient canvas overlay
  */
 
@@ -19,108 +20,79 @@ import React, {
   useState, useRef, useEffect, useCallback, useMemo,
 } from 'react';
 import {
-  Eye, EyeOff, Plus, Trash2, X, Settings,
+  Eye, EyeOff, Trash2, X, Settings, Upload,
 } from 'lucide-react';
 import {
-  ZoneProfile, WallDef, Direction, ConstructionType,
-  SensorPlacement, ZoneOffset, OfficeFloorPlan, CustomRoom,
+  ZoneProfile,
+  SensorPlacement, OfficeFloorPlan,
 } from '../types';
 import { AllSensorsData } from '../services/liveDataService';
 import {
   computeZoneHotPockets, SensorWithTemp, HotPocketScore,
-  scoreToColor, DEFAULT_HOT_POCKET_CONFIG, HotPocketConfig,
+  DEFAULT_HOT_POCKET_CONFIG, HotPocketConfig,
 } from '../services/hotPocketEngine';
 import { renderIDWToCanvas, IDWPoint } from '../utils/idwInterpolation';
 
-// ── constants ──────────────────────────────────────────────────────────────
+// ── constants ───────────────────────────────────────────────────────────────
 
-const SCALE = 50;     // SVG pixels per metre
-const MARGIN = 2;     // metres of padding around the layout
-const ZONE_GAP = 3;   // metres between auto-placed zones
-const CUSTOM_FP_W = 770;  // custom floor plan image width (px)
-const CUSTOM_FP_H = 650;  // custom floor plan image height (px)
+const SCALE = 50;   // SVG pixels per metre (used for dimension display)
+const SVG_W = 900;  // canvas width  (px)
+const SVG_H = 700;  // canvas height (px)
 
-/** Room outlines extracted from the drawio floor plan (pixel coords matching the SVG). */
-const DEFAULT_ROOMS: CustomRoom[] = [
-  { id: 'room-meeting',   label: 'MEETING ROOM',  x: 40,    y: 40,    w: 130,  h: 270  },
-  { id: 'room-pantry',    label: 'Pantry',         x: 40,    y: 310,   w: 130,  h: 130  },
-  { id: 'room-embedded',  label: 'EMBEDDED TEAM',  x: 42,    y: 440,   w: 128,  h: 70   },
-  { id: 'room-washroom',  label: 'Washroom',       x: 158.75,y: 320,   w: 110,  h: 60   },
-  { id: 'room-reception', label: 'Reception Area', x: 357.5, y: 277.5, w: 230,  h: 95   },
-  { id: 'room-wa2',       label: 'WORKING AREA 2', x: 270,   y: 160,   w: 200,  h: 120  },
-  { id: 'room-wa1',       label: 'WORKING AREA 1', x: 170,   y: 490,   w: 390,  h: 80   },
-];
+// ── wall segment type (extracted from mxGraph XML) ──────────────────────────
 
-// ── geometry helpers ────────────────────────────────────────────────────────
+interface WallSegment {
+  id: string;
+  x1: number; y1: number;
+  x2: number; y2: number;
+  lengthPx: number;  // original pixel length; divide by SCALE to get metres
+}
 
-interface Point { x: number; y: number }
+// ── helpers ──────────────────────────────────────────────────────────────────
 
-/** Compute polygon vertices (in metres, relative to zone origin) from wall list. */
-function wallsToPolyMetres(walls: WallDef[]): Point[] {
-  const pts: Point[] = [{ x: 0, y: 0 }];
-  let x = 0, y = 0;
-  for (const w of walls) {
-    const az = w.azimuth * Math.PI / 180;
-    x += w.lengthM * Math.sin(az);
-    y -= w.lengthM * Math.cos(az); // SVG y-down
-    pts.push({ x, y });
+/**
+ * Parse the mxGraph XML embedded in a draw.io SVG's `content` attribute
+ * and return one WallSegment per edge of every rectangle shape found.
+ */
+function extractWallsFromSvg(svgText: string): WallSegment[] {
+  try {
+    const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+    const content = doc.querySelector('svg')?.getAttribute('content') ?? '';
+    const decoded = content
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"').replace(/&amp;/g, '&')
+      .replace(/&#10;/g, '\n');
+
+    const walls: WallSegment[] = [];
+    // Match mxCell nodes that have a child mxGeometry with x/y/width/height
+    const re = /<mxCell\b[^>]*>[\s\S]*?<mxGeometry\b[^>]*x="([^"]+)"[^>]*y="([^"]+)"[^>]*width="([^"]+)"[^>]*height="([^"]+)"/g;
+    let m: RegExpExecArray | null;
+    let i = 0;
+    while ((m = re.exec(decoded)) !== null) {
+      const x = +m[1], y = +m[2], w = +m[3], h = +m[4];
+      if (!w || !h) continue;
+      const base = `w${i++}`;
+      walls.push(
+        { id: `${base}-top`,    x1: x,   y1: y,   x2: x+w, y2: y,   lengthPx: w },
+        { id: `${base}-right`,  x1: x+w, y1: y,   x2: x+w, y2: y+h, lengthPx: h },
+        { id: `${base}-bottom`, x1: x,   y1: y+h, x2: x+w, y2: y+h, lengthPx: w },
+        { id: `${base}-left`,   x1: x,   y1: y,   x2: x,   y2: y+h, lengthPx: h },
+      );
+    }
+    return walls;
+  } catch {
+    return [];
   }
-  return pts;
 }
 
-/** Compute the wall midpoint in metres (relative to zone origin). */
-function wallMidpoint(walls: WallDef[], wallIndex: number): Point {
-  const pts = wallsToPolyMetres(walls);
-  const a = pts[wallIndex];
-  const b = pts[wallIndex + 1] ?? pts[0];
-  return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
+/** Decode a data URL produced by handleSvgUpload back to raw SVG text. */
+function dataUrlToSvgText(dataUrl: string): string {
+  return decodeURIComponent(
+    dataUrl.replace(/^data:image\/svg\+xml;charset=utf-8,/, '')
+  );
 }
 
-/** Compute axis-aligned bounding box in metres (relative to zone origin). */
-function zoneBBox(walls: WallDef[]): { minX: number; maxX: number; minY: number; maxY: number } {
-  const pts = wallsToPolyMetres(walls);
-  return {
-    minX: Math.min(...pts.map(p => p.x)),
-    maxX: Math.max(...pts.map(p => p.x)),
-    minY: Math.min(...pts.map(p => p.y)),
-    maxY: Math.max(...pts.map(p => p.y)),
-  };
-}
-
-/** Compute centroid of polygon vertices. */
-function zoneCentroid(walls: WallDef[]): Point {
-  const pts = wallsToPolyMetres(walls);
-  const x = pts.reduce((s, p) => s + p.x, 0) / pts.length;
-  const y = pts.reduce((s, p) => s + p.y, 0) / pts.length;
-  return { x, y };
-}
-
-/** Auto-compute initial zone offsets: row layout with ZONE_GAP spacing. */
-function computeDefaultOffsets(zones: ZoneProfile[]): ZoneOffset[] {
-  const offsets: ZoneOffset[] = [];
-  let cursorX = MARGIN;
-  for (const z of zones) {
-    const bb = zoneBBox(z.zone.walls);
-    offsets.push({
-      zoneId:  z.id,
-      offsetX: cursorX - bb.minX,
-      offsetY: MARGIN  - bb.minY,
-    });
-    cursorX += (bb.maxX - bb.minX) + ZONE_GAP;
-  }
-  return offsets;
-}
-
-/** Merge saved offsets with any newly-added zones. */
-function mergeOffsets(zones: ZoneProfile[], saved: ZoneOffset[]): ZoneOffset[] {
-  const defaults = computeDefaultOffsets(zones);
-  return zones.map(z => {
-    const saved_ = saved.find(o => o.zoneId === z.id);
-    return saved_ ?? defaults.find(o => o.zoneId === z.id)!;
-  });
-}
-
-// ── sensor classification helper (mirrors ResultsDashboard logic) ────────────
+// ── sensor classification helper ─────────────────────────────────────────────
 
 function classifySensor(
   name: string,
@@ -143,7 +115,7 @@ function classifySensor(
   return name.toLowerCase().includes('ac') ? 'ceiling' : 'desk';
 }
 
-// ── flow-direction helpers ──────────────────────────────────────────────────
+// ── flow-direction helpers ────────────────────────────────────────────────────
 
 const DIRECTIONS_8 = [
   { label: 'N',  deg:   0 },
@@ -156,28 +128,21 @@ const DIRECTIONS_8 = [
   { label: 'NW', deg: 315 },
 ];
 
-// ── sub-components ──────────────────────────────────────────────────────────
+// ── sub-components ────────────────────────────────────────────────────────────
 
-/** Small popover for editing wall length inline. */
+/** Inline popover to edit a wall length. */
 function WallEditPopover({
-  wallLength,
-  onSave,
-  onDelete,
-  onClose,
-  svgX,
-  svgY,
+  wallLength, onSave, onClose, svgX, svgY,
 }: {
   wallLength: number;
   onSave: (len: number) => void;
-  onDelete: () => void;
   onClose: () => void;
-  svgX: number;
-  svgY: number;
+  svgX: number; svgY: number;
 }) {
   const [val, setVal] = useState(wallLength.toFixed(2));
   return (
     <div
-      style={{ position: 'absolute', left: svgX + 8, top: svgY - 24, zIndex: 50 }}
+      style={{ position: 'absolute', left: svgX + 8, top: Math.max(0, svgY - 48), zIndex: 50 }}
       className="bg-slate-800 border border-slate-600 rounded-xl shadow-xl p-3 flex flex-col gap-2 w-48"
     >
       <div className="flex items-center justify-between">
@@ -186,10 +151,7 @@ function WallEditPopover({
       </div>
       <div className="flex items-center gap-1">
         <input
-          type="number"
-          value={val}
-          step="0.1"
-          min="0.5"
+          type="number" value={val} step="0.1" min="0.1"
           onChange={e => setVal(e.target.value)}
           className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white text-sm outline-none focus:border-blue-500"
           autoFocus
@@ -197,30 +159,18 @@ function WallEditPopover({
         />
         <span className="text-slate-400 text-xs">m</span>
       </div>
-      <div className="flex gap-2">
-        <button
-          onClick={() => onSave(parseFloat(val) || wallLength)}
-          className="flex-1 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded-lg py-1 font-medium"
-        >
-          Save
-        </button>
-        <button
-          onClick={onDelete}
-          className="px-2 py-1 text-red-400 hover:text-red-300 hover:bg-red-900/30 rounded-lg"
-          title="Delete wall"
-        >
-          <Trash2 size={12} />
-        </button>
-      </div>
+      <button
+        onClick={() => onSave(parseFloat(val) || wallLength)}
+        className="bg-blue-600 hover:bg-blue-500 text-white text-xs rounded-lg py-1 font-medium"
+      >
+        Save
+      </button>
     </div>
   );
 }
 
-/** Modal for selecting AC airflow direction after placing a ceiling sensor. */
-function FlowDirectionModal({
-  onSelect,
-  onSkip,
-}: {
+/** Modal for selecting AC airflow direction. */
+function FlowDirectionModal({ onSelect, onSkip }: {
   onSelect: (deg: number) => void;
   onSkip: () => void;
 }) {
@@ -236,11 +186,8 @@ function FlowDirectionModal({
         </p>
         <div className="grid grid-cols-3 gap-2">
           {DIRECTIONS_8.map(d => (
-            <button
-              key={d.deg}
-              onClick={() => onSelect(d.deg)}
-              className="bg-slate-700 hover:bg-blue-600 text-white text-sm rounded-lg py-2 font-medium transition-colors"
-            >
+            <button key={d.deg} onClick={() => onSelect(d.deg)}
+              className="bg-slate-700 hover:bg-blue-600 text-white text-sm rounded-lg py-2 font-medium transition-colors">
               {d.label}
             </button>
           ))}
@@ -253,81 +200,7 @@ function FlowDirectionModal({
   );
 }
 
-/** Add-wall dialog. */
-function AddWallDialog({
-  onAdd,
-  onClose,
-}: {
-  onAdd: (wall: Omit<WallDef, 'id'>) => void;
-  onClose: () => void;
-}) {
-  const [len, setLen]  = useState(3);
-  const [dir, setDir]  = useState<Direction>('N');
-  const [type, setType] = useState<'external' | 'internal'>('external');
-  const [ctor, setCtor] = useState<ConstructionType>('opaque');
-  const AZIMUTH_MAP: Record<string, number> = {
-    N: 0, NE: 45, E: 90, SE: 135, S: 180, SW: 225, W: 270, NW: 315,
-  };
-  return (
-    <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-      <div className="bg-slate-800 border border-slate-600 rounded-2xl p-6 w-80 shadow-2xl">
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-white font-semibold">Add Wall</h3>
-          <button onClick={onClose} className="text-slate-500 hover:text-white"><X size={16} /></button>
-        </div>
-        <div className="space-y-3">
-          <label className="block">
-            <span className="text-xs text-slate-400 uppercase font-semibold">Length (m)</span>
-            <input type="number" value={len} min={0.5} step={0.1}
-              onChange={e => setLen(parseFloat(e.target.value) || 1)}
-              className="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm outline-none focus:border-blue-500"
-            />
-          </label>
-          <label className="block">
-            <span className="text-xs text-slate-400 uppercase font-semibold">Direction</span>
-            <select value={dir} onChange={e => setDir(e.target.value as Direction)}
-              className="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm outline-none">
-              {(['N','NE','E','SE','S','SW','W','NW'] as Direction[]).map(d => (
-                <option key={d} value={d}>{d}</option>
-              ))}
-            </select>
-          </label>
-          <label className="block">
-            <span className="text-xs text-slate-400 uppercase font-semibold">Wall Type</span>
-            <select value={type} onChange={e => setType(e.target.value as 'external'|'internal')}
-              className="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm outline-none">
-              <option value="external">External</option>
-              <option value="internal">Internal (partition)</option>
-            </select>
-          </label>
-          <label className="block">
-            <span className="text-xs text-slate-400 uppercase font-semibold">Construction</span>
-            <select value={ctor} onChange={e => setCtor(e.target.value as ConstructionType)}
-              className="mt-1 w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-white text-sm outline-none">
-              <option value="opaque">Opaque</option>
-              <option value="mixed">Mixed (with windows)</option>
-              <option value="full_glass">Full Glass</option>
-            </select>
-          </label>
-        </div>
-        <div className="flex gap-2 mt-5">
-          <button onClick={onClose}
-            className="flex-1 bg-slate-700 hover:bg-slate-600 text-white text-sm rounded-lg py-2">
-            Cancel
-          </button>
-          <button
-            onClick={() => onAdd({ lengthM: len, direction: dir, azimuth: AZIMUTH_MAP[dir],
-              wallType: type, constructionType: ctor })}
-            className="flex-1 bg-blue-600 hover:bg-blue-500 text-white text-sm rounded-lg py-2 font-medium">
-            Add
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-// ── main component ──────────────────────────────────────────────────────────
+// ── main component ────────────────────────────────────────────────────────────
 
 export interface FloorPlanEditorProps {
   zones:         ZoneProfile[];
@@ -335,168 +208,101 @@ export interface FloorPlanEditorProps {
   allLiveSensors: AllSensorsData | null;
   floorPlan:     OfficeFloorPlan;
   setFloorPlan:  (fp: OfficeFloorPlan | ((prev: OfficeFloorPlan) => OfficeFloorPlan)) => void;
+  floorPlanSvg:     string | null;
+  setFloorPlanSvg:  (url: string | null) => void;
 }
 
 const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
-  zones, setZones, allLiveSensors, floorPlan, setFloorPlan,
+  zones, allLiveSensors, floorPlan, setFloorPlan, floorPlanSvg, setFloorPlanSvg,
 }) => {
 
-  // ── local UI state ────────────────────────────────────────────────────────
+  // ── UI state ────────────────────────────────────────────────────────────────
   const [showHeatmap,  setShowHeatmap]  = useState(false);
-  const [hoveredWall,  setHoveredWall]  = useState<{ zoneId: string; wallIdx: number } | null>(null);
-  const [selectedWall, setSelectedWall] = useState<{
-    zoneId: string; wallIdx: number; svgX: number; svgY: number;
-  } | null>(null);
-  const [showAddWall,    setShowAddWall]    = useState(false);
-  const [addWallZoneId,  setAddWallZoneId]  = useState<string | null>(null);
-  const [selectedSensorKey,     setSelectedSensorKey]     = useState<string | null>(null);
-  const [pendingFlowSensorKey,  setPendingFlowSensorKey]  = useState<string | null>(null);
-  const [sidebarZoneId,  setSidebarZoneId]  = useState<string>(zones[0]?.id ?? '');
+  const [showConfig,   setShowConfig]   = useState(false);
   const [config, setConfig] = useState<HotPocketConfig>(DEFAULT_HOT_POCKET_CONFIG);
-  const [showConfig, setShowConfig] = useState(false);
-  // Room dimension editing state
-  const [editingRoom, setEditingRoom] = useState<{
-    id: string; edge: 'w' | 'h'; value: number; svgX: number; svgY: number;
+
+  const [selectedSensorKey,    setSelectedSensorKey]    = useState<string | null>(null);
+  const [pendingFlowSensorKey, setPendingFlowSensorKey] = useState<string | null>(null);
+  const [sidebarZoneId, setSidebarZoneId] = useState<string>(zones[0]?.id ?? '');
+
+  // Wall editing
+  const [svgWalls,     setSvgWalls]     = useState<WallSegment[]>([]);
+  const [wallOverrides, setWallOverrides] = useState<Record<string, number>>(() => {
+    try { return JSON.parse(localStorage.getItem('thermozone_wall_overrides') ?? '{}'); }
+    catch { return {}; }
+  });
+  const [hoveredWallId,  setHoveredWallId]  = useState<string | null>(null);
+  const [selectedWall,   setSelectedWall]   = useState<{
+    wall: WallSegment; svgX: number; svgY: number;
   } | null>(null);
 
-  // Hovered room wall (for highlight + label)
-  const [hoveredRoomWall, setHoveredRoomWall] = useState<{
-    roomId: string; side: 'top' | 'right' | 'bottom' | 'left';
-  } | null>(null);
-
-  // Room drag ref
-  const roomDragRef = useRef<{
-    roomId: string; startSvgX: number; startSvgY: number;
-    startRoomX: number; startRoomY: number;
-  } | null>(null);
-
-  // Zone drag state
-  const zoneDragRef = useRef<{
-    zoneId: string; startSvgX: number; startSvgY: number;
-    startOffX: number; startOffY: number;
-  } | null>(null);
-
-  // Sensor drag from sidebar
-  const dragSensorRef = useRef<{ key: string; name: string; classifiedType: 'desk'|'ceiling'; zoneId: string } | null>(null);
-
+  // Refs
   const svgRef       = useRef<SVGSVGElement>(null);
   const heatmapRef   = useRef<HTMLCanvasElement>(null);
-  const containerRef = useRef<HTMLDivElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragSensorRef = useRef<{
+    key: string; name: string; classifiedType: 'desk' | 'ceiling'; zoneId: string;
+  } | null>(null);
+  const placedSensorDragRef = useRef<{ key: string } | null>(null);
 
-  // ── derived data ──────────────────────────────────────────────────────────
+  // ── Re-extract walls on mount / when SVG URL changes ────────────────────────
+  useEffect(() => {
+    if (!floorPlanSvg) { setSvgWalls([]); return; }
+    try {
+      const text = dataUrlToSvgText(floorPlanSvg);
+      setSvgWalls(extractWallsFromSvg(text));
+    } catch { setSvgWalls([]); }
+  }, [floorPlanSvg]);
 
-  /** Custom room outlines — seeded from DEFAULT_ROOMS if not yet saved. */
-  const customRooms: CustomRoom[] = useMemo(
-    () => (floorPlan.customRooms && floorPlan.customRooms.length > 0)
-      ? floorPlan.customRooms
-      : DEFAULT_ROOMS,
-    [floorPlan.customRooms],
-  );
-
-  /** Update a room's width or height and persist. */
-  const updateRoomDimension = useCallback((id: string, edge: 'w' | 'h', value: number) => {
-    setFloorPlan(prev => ({
-      ...prev,
-      customRooms: (prev.customRooms ?? DEFAULT_ROOMS).map(r =>
-        r.id === id ? { ...r, [edge]: Math.max(10, value) } : r
-      ),
-    }));
-  }, [setFloorPlan]);
-
-  /** Move a room to a new position. */
-  const moveRoom = useCallback((id: string, x: number, y: number) => {
-    setFloorPlan(prev => ({
-      ...prev,
-      customRooms: (prev.customRooms ?? DEFAULT_ROOMS).map(r =>
-        r.id === id ? { ...r, x: Math.max(0, x), y: Math.max(0, y) } : r
-      ),
-    }));
-  }, [setFloorPlan]);
-
-  /** Add a new blank room at the centre of the canvas. */
-  const addRoom = useCallback(() => {
-    const newRoom: CustomRoom = {
-      id:    `room-${Date.now()}`,
-      label: 'New Room',
-      x:     CUSTOM_FP_W / 2 - 75,
-      y:     CUSTOM_FP_H / 2 - 50,
-      w:     150,
-      h:     100,
+  // ── SVG upload ───────────────────────────────────────────────────────────────
+  const handleSvgUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = ev => {
+      const text = ev.target?.result as string;
+      const dataUrl = `data:image/svg+xml;charset=utf-8,${encodeURIComponent(text)}`;
+      setFloorPlanSvg(dataUrl);
+      setSvgWalls(extractWallsFromSvg(text));
+      // Clear sensor placements and wall overrides when a new plan is loaded
+      setFloorPlan(prev => ({ ...prev, sensors: [] }));
+      const cleared: Record<string, number> = {};
+      setWallOverrides(cleared);
+      localStorage.removeItem('thermozone_wall_overrides');
     };
-    setFloorPlan(prev => ({
-      ...prev,
-      customRooms: [...(prev.customRooms ?? DEFAULT_ROOMS), newRoom],
-    }));
-  }, [setFloorPlan]);
-
-  /** Delete a room by id. */
-  const deleteRoom = useCallback((id: string) => {
-    setFloorPlan(prev => ({
-      ...prev,
-      customRooms: (prev.customRooms ?? DEFAULT_ROOMS).filter(r => r.id !== id),
-    }));
-  }, [setFloorPlan]);
-
-  /** Effective zone offsets: merge saved with defaults for any new zones. */
-  const zoneOffsets = useMemo(
-    () => mergeOffsets(zones, floorPlan.zoneOffsets),
-    [zones, floorPlan.zoneOffsets],
-  );
-
-  const getOffset = useCallback(
-    (zoneId: string): ZoneOffset =>
-      zoneOffsets.find(o => o.zoneId === zoneId) ?? { zoneId, offsetX: MARGIN, offsetY: MARGIN },
-    [zoneOffsets],
-  );
-
-  /** Convert metres → SVG pixels. */
-  const mToSvg = (m: number) => m * SCALE;
-
-  /** Convert a zone-local point (metres) to SVG pixels. */
-  const toSVG = (zoneId: string, local: Point): Point => {
-    const off = getOffset(zoneId);
-    return {
-      x: (off.offsetX + local.x) * SCALE,
-      y: (off.offsetY + local.y) * SCALE,
-    };
+    reader.readAsText(file);
+    e.target.value = '';
   };
 
-  /** SVG viewport size — always uses the custom floor plan dimensions. */
-  const svgSize = useMemo(
-    () => ({ width: CUSTOM_FP_W, height: CUSTOM_FP_H }),
-    [],
-  );
+  const saveWallOverride = (id: string, px: number) => {
+    const next = { ...wallOverrides, [id]: px };
+    setWallOverrides(next);
+    localStorage.setItem('thermozone_wall_overrides', JSON.stringify(next));
+  };
 
-  /** Build sensor list from allLiveSensors for the currently selected sidebar zone. */
+  // ── Derived data ─────────────────────────────────────────────────────────────
+
   const sidebarZone = useMemo(() => zones.find(z => z.id === sidebarZoneId), [zones, sidebarZoneId]);
 
   const sidebarSensors = useMemo(() => {
     if (!allLiveSensors || !sidebarZone) return { desk: [], ceiling: [] };
-    const zoneName = sidebarZone.zone.name;
-    const zoneSensors = allLiveSensors.sensors.filter(s => s.effectiveZone === zoneName);
+    const zoneSensors = allLiveSensors.sensors.filter(s => s.effectiveZone === sidebarZone.zone.name);
     const others = zoneSensors.map(s => s.temp);
     const desk: typeof zoneSensors = [];
     const ceiling: typeof zoneSensors = [];
     for (const s of zoneSensors) {
-      const cl = classifySensor(
-        s.name, s.temp,
-        sidebarZone.sensorPositions,
-        sidebarZone.hasDeskSensors,
-        others.filter(t => t !== s.temp),
-      );
+      const cl = classifySensor(s.name, s.temp, sidebarZone.sensorPositions, sidebarZone.hasDeskSensors, others.filter(t => t !== s.temp));
       if (cl === 'desk')    desk.push(s);
       if (cl === 'ceiling') ceiling.push(s);
     }
     return { desk, ceiling };
   }, [allLiveSensors, sidebarZone]);
 
-  /** All placed sensors as a lookup map. */
   const placedMap = useMemo(
     () => new Map(floorPlan.sensors.map(s => [s.sensorKey, s])),
     [floorPlan.sensors],
   );
 
-  /** Build SensorWithTemp[] for hot-pocket engine from all zones. */
   const sensorsForEngine = useMemo((): SensorWithTemp[] => {
     if (!allLiveSensors) return [];
     const result: SensorWithTemp[] = [];
@@ -504,19 +310,11 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       const zoneSensors = allLiveSensors.sensors.filter(s => s.effectiveZone === z.zone.name);
       const others = zoneSensors.map(s => s.temp);
       for (const s of zoneSensors) {
-        const cl = classifySensor(
-          s.name, s.temp, z.sensorPositions, z.hasDeskSensors,
-          others.filter(t => t !== s.temp),
-        );
-        const placed  = placedMap.get(s.key);
-        const role    = placed?.role ?? (cl === 'excluded' ? 'excluded' : 'normal');
-        result.push({
-          key: s.key, name: s.name, temp: s.temp,
-          classifiedType: cl === 'excluded' ? 'desk' : cl,
-          role,
-          zoneId:  z.id,
-          setpoint: s.setpoint,
-        });
+        const cl = classifySensor(s.name, s.temp, z.sensorPositions, z.hasDeskSensors, others.filter(t => t !== s.temp));
+        const placed = placedMap.get(s.key);
+        const role   = placed?.role ?? (cl === 'excluded' ? 'excluded' : 'normal');
+        result.push({ key: s.key, name: s.name, temp: s.temp,
+          classifiedType: cl === 'excluded' ? 'desk' : cl, role, zoneId: z.id, setpoint: s.setpoint });
       }
     }
     return result;
@@ -529,56 +327,36 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
 
   const hotPocketMap = useMemo(() => {
     const m = new Map<string, HotPocketScore>();
-    for (const r of hotPocketResults) {
+    for (const r of hotPocketResults)
       for (const s of r.deskScores) m.set(s.sensorKey, s);
-    }
     return m;
   }, [hotPocketResults]);
 
-  // ── heatmap rendering ─────────────────────────────────────────────────────
-
+  // ── Heatmap ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     const canvas = heatmapRef.current;
     if (!canvas || !showHeatmap) return;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    // Build IDW control points from placed desk sensors that have scores
     const points: IDWPoint[] = [];
     for (const sp of floorPlan.sensors) {
       if (sp.classifiedType !== 'desk' || sp.role !== 'normal') continue;
       const score = hotPocketMap.get(sp.sensorKey);
       if (!score) continue;
-      const off = getOffset(sp.zoneId);
-      points.push({
-        x: (off.offsetX + sp.x) * SCALE,
-        y: (off.offsetY + sp.y) * SCALE,
-        value: score.score,
-      });
+      points.push({ x: sp.x * SCALE, y: sp.y * SCALE, value: score.score });
     }
+    if (points.length > 0) renderIDWToCanvas(ctx, points, canvas.width, canvas.height, 8, 0.55);
+  }, [showHeatmap, floorPlan.sensors, hotPocketMap]);
 
-    if (points.length > 0) {
-      renderIDWToCanvas(ctx, points, canvas.width, canvas.height, 8, 0.55);
-    }
-  }, [showHeatmap, floorPlan.sensors, hotPocketMap, zoneOffsets, svgSize]);
-
-  // ── floorPlan mutators ────────────────────────────────────────────────────
-
-  const updateOffset = useCallback((zoneId: string, offsetX: number, offsetY: number) => {
-    setFloorPlan({
-      ...floorPlan,
-      zoneOffsets: zoneOffsets.map(o => o.zoneId === zoneId ? { zoneId, offsetX, offsetY } : o),
-    });
-  }, [floorPlan, zoneOffsets, setFloorPlan]);
+  // ── Sensor mutators ──────────────────────────────────────────────────────────
 
   const placeSensor = useCallback((sp: SensorPlacement) => {
     setFloorPlan(prev => ({
       ...prev,
       sensors: [...prev.sensors.filter(s => s.sensorKey !== sp.sensorKey), sp],
     }));
-  }, [setFloorPlan]);  // no floorPlan dependency → never stale
+  }, [setFloorPlan]);
 
   const removePlacedSensor = useCallback((key: string) => {
     setFloorPlan({ ...floorPlan, sensors: floorPlan.sensors.filter(s => s.sensorKey !== key) });
@@ -586,103 +364,24 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   }, [floorPlan, setFloorPlan, selectedSensorKey]);
 
   const updateSensorRole = useCallback((key: string, role: SensorPlacement['role']) => {
-    setFloorPlan({
-      ...floorPlan,
-      sensors: floorPlan.sensors.map(s => s.sensorKey === key ? { ...s, role } : s),
-    });
+    setFloorPlan({ ...floorPlan, sensors: floorPlan.sensors.map(s => s.sensorKey === key ? { ...s, role } : s) });
   }, [floorPlan, setFloorPlan]);
 
   const updateSensorPosition = useCallback((key: string, x: number, y: number) => {
-    setFloorPlan({
-      ...floorPlan,
-      sensors: floorPlan.sensors.map(s => s.sensorKey === key ? { ...s, x, y } : s),
-    });
+    setFloorPlan({ ...floorPlan, sensors: floorPlan.sensors.map(s => s.sensorKey === key ? { ...s, x, y } : s) });
   }, [floorPlan, setFloorPlan]);
 
   const updateSensorFlow = useCallback((key: string, deg: number) => {
-    setFloorPlan({
-      ...floorPlan,
-      sensors: floorPlan.sensors.map(s => s.sensorKey === key ? { ...s, flowDirection: deg } : s),
-    });
+    setFloorPlan({ ...floorPlan, sensors: floorPlan.sensors.map(s => s.sensorKey === key ? { ...s, flowDirection: deg } : s) });
     setPendingFlowSensorKey(null);
   }, [floorPlan, setFloorPlan]);
 
-  // ── wall mutators ─────────────────────────────────────────────────────────
+  // ── SVG interaction ──────────────────────────────────────────────────────────
 
-  const updateWallLength = (zoneId: string, wallIdx: number, len: number) => {
-    setZones(zones.map(z => z.id !== zoneId ? z : {
-      ...z,
-      zone: {
-        ...z.zone,
-        walls: z.zone.walls.map((w, i) => i === wallIdx ? { ...w, lengthM: len } : w),
-      },
-    }));
-    setSelectedWall(null);
-  };
-
-  const deleteWall = (zoneId: string, wallIdx: number) => {
-    setZones(zones.map(z => z.id !== zoneId ? z : {
-      ...z,
-      zone: {
-        ...z.zone,
-        walls: z.zone.walls.filter((_, i) => i !== wallIdx),
-      },
-    }));
-    setSelectedWall(null);
-  };
-
-  const addWall = (wall: Omit<WallDef, 'id'>) => {
-    const zid = addWallZoneId ?? zones[0]?.id;
-    if (!zid) return;
-    const newId = `w-${Date.now()}`;
-    setZones(zones.map(z => z.id !== zid ? z : {
-      ...z,
-      zone: { ...z.zone, walls: [...z.zone.walls, { id: newId, ...wall }] },
-    }));
-    setShowAddWall(false);
-    setAddWallZoneId(null);
-  };
-
-  // ── SVG interaction (zone drag + wall click) ──────────────────────────────
-
-  const svgCoordsFromEvent = (e: React.MouseEvent<SVGSVGElement>): Point => {
+  const svgCoordsFromEvent = (e: React.MouseEvent<SVGSVGElement>) => {
     const rect = svgRef.current!.getBoundingClientRect();
-    return {
-      x: (e.clientX - rect.left),
-      y: (e.clientY - rect.top),
-    };
+    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
   };
-
-  const handleSvgMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
-    if (!zoneDragRef.current) return;
-    const { zoneId, startSvgX, startSvgY, startOffX, startOffY } = zoneDragRef.current;
-    const cur = svgCoordsFromEvent(e);
-    const dxM = (cur.x - startSvgX) / SCALE;
-    const dyM = (cur.y - startSvgY) / SCALE;
-    updateOffset(zoneId, startOffX + dxM, startOffY + dyM);
-  };
-
-  const handleSvgMouseUp = () => {
-    zoneDragRef.current = null;
-  };
-
-  const startZoneDrag = (e: React.MouseEvent, zoneId: string) => {
-    e.stopPropagation();
-    const cur = svgCoordsFromEvent(e as any);
-    const off = getOffset(zoneId);
-    zoneDragRef.current = {
-      zoneId,
-      startSvgX: cur.x, startSvgY: cur.y,
-      startOffX: off.offsetX, startOffY: off.offsetY,
-    };
-  };
-
-  const handleWallClick = (e: React.MouseEvent, zoneId: string, wallIdx: number, svgX: number, svgY: number) => {
-    e.stopPropagation();
-    setSelectedWall({ zoneId, wallIdx, svgX, svgY });
-  };
-
-  // ── canvas drop (place sensor) ────────────────────────────────────────────
 
   const handleCanvasDragOver = (e: React.DragEvent) => { e.preventDefault(); };
 
@@ -690,88 +389,39 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     e.preventDefault();
     const drag = dragSensorRef.current;
     if (!drag) return;
-
     const rect = svgRef.current!.getBoundingClientRect();
-    const svgX = e.clientX - rect.left;
-    const svgY = e.clientY - rect.top;
-
-    // Always use raw pixel / SCALE — no zone offset in custom floor plan mode
-    const xM = svgX / SCALE;
-    const yM = svgY / SCALE;
-
-    const newPlacement: SensorPlacement = {
-      sensorKey:      drag.key,
-      sensorName:     drag.name,
-      classifiedType: drag.classifiedType,
-      role:           'normal',
-      zoneId:         drag.zoneId,
-      x: parseFloat(xM.toFixed(2)),
-      y: parseFloat(yM.toFixed(2)),
-      isCustomMode:   true,
-    };
-
-    placeSensor(newPlacement);
+    const xM = parseFloat(((e.clientX - rect.left) / SCALE).toFixed(2));
+    const yM = parseFloat(((e.clientY - rect.top)  / SCALE).toFixed(2));
+    placeSensor({
+      sensorKey: drag.key, sensorName: drag.name,
+      classifiedType: drag.classifiedType, role: 'normal',
+      zoneId: drag.zoneId, x: xM, y: yM, isCustomMode: true,
+    });
     dragSensorRef.current = null;
-
-    if (drag.classifiedType === 'ceiling') {
-      setPendingFlowSensorKey(drag.key);
-    }
+    if (drag.classifiedType === 'ceiling') setPendingFlowSensorKey(drag.key);
   };
 
-  // ── placed sensor drag (reposition) ──────────────────────────────────────
-
-  const placedSensorDragRef = useRef<{ key: string; zoneId: string } | null>(null);
-
-  const handlePlacedSensorMouseDown = (e: React.MouseEvent, key: string, zoneId: string) => {
-    e.stopPropagation();
-    placedSensorDragRef.current = { key, zoneId };
+  const handleSvgMouseMove = (e: React.MouseEvent<SVGSVGElement>) => {
+    if (!placedSensorDragRef.current) return;
+    const { key } = placedSensorDragRef.current;
+    const cur = svgCoordsFromEvent(e);
+    updateSensorPosition(key,
+      parseFloat((cur.x / SCALE).toFixed(2)),
+      parseFloat((cur.y / SCALE).toFixed(2)),
+    );
   };
 
-  const handleSvgMouseMoveForSensor = (e: React.MouseEvent<SVGSVGElement>) => {
-    // Room drag
-    if (roomDragRef.current) {
-      const { roomId, startSvgX, startSvgY, startRoomX, startRoomY } = roomDragRef.current;
-      const cur = svgCoordsFromEvent(e);
-      moveRoom(roomId, startRoomX + (cur.x - startSvgX), startRoomY + (cur.y - startSvgY));
-      return;
-    }
-    // Placed sensor drag
-    if (placedSensorDragRef.current) {
-      const { key, zoneId } = placedSensorDragRef.current;
-      const cur = svgCoordsFromEvent(e);
-      const sensor = floorPlan.sensors.find(s => s.sensorKey === key);
-      let xM: number, yM: number;
-      if (sensor?.isCustomMode) {
-        xM = parseFloat((cur.x / SCALE).toFixed(2));
-        yM = parseFloat((cur.y / SCALE).toFixed(2));
-      } else {
-        const off = getOffset(zoneId);
-        xM = parseFloat((cur.x / SCALE - off.offsetX).toFixed(2));
-        yM = parseFloat((cur.y / SCALE - off.offsetY).toFixed(2));
-      }
-      updateSensorPosition(key, xM, yM);
-    }
-    handleSvgMouseMove(e);
-  };
+  const handleSvgMouseUp = () => { placedSensorDragRef.current = null; };
 
-  const handleSvgMouseUpAll = () => {
-    placedSensorDragRef.current = null;
-    roomDragRef.current = null;
-    handleSvgMouseUp();
-  };
+  // ── Selected sensor detail ───────────────────────────────────────────────────
 
-  // ── selected sensor detail ────────────────────────────────────────────────
-
-  const selectedSensor = selectedSensorKey ? placedMap.get(selectedSensorKey) : null;
-  const selectedScore  = selectedSensorKey ? hotPocketMap.get(selectedSensorKey) : null;
+  const selectedSensor   = selectedSensorKey ? placedMap.get(selectedSensorKey) : null;
+  const selectedScore    = selectedSensorKey ? hotPocketMap.get(selectedSensorKey) : null;
   const selectedLiveData = allLiveSensors?.sensors.find(s => s.key === selectedSensorKey);
 
-  // Nearest AC distances — separate X and Y components (in metres)
   const acDistances = useMemo(() => {
     if (!selectedSensor) return null;
-    const acs = floorPlan.sensors.filter(
-      s => s.classifiedType === 'ceiling' && s.role !== 'excluded',
-    );
+    const acs = floorPlan.sensors.filter(s => s.classifiedType === 'ceiling' && s.role !== 'excluded');
     if (acs.length === 0) return null;
     let best: { dx: number; dy: number; dist: number; acName: string } | null = null;
     for (const ac of acs) {
@@ -783,24 +433,31 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     return best;
   }, [selectedSensor, floorPlan.sensors]);
 
-  // ── render ────────────────────────────────────────────────────────────────
-
-  const totalWidth  = svgSize.width  + 300; // sidebar
+  // ── Render ───────────────────────────────────────────────────────────────────
 
   return (
-    <div className="flex flex-col h-full select-none" ref={containerRef}>
+    <div className="flex flex-col h-full select-none">
 
       {/* ── Toolbar ── */}
       <div className="flex items-center gap-3 px-4 py-3 bg-slate-900/60 border-b border-slate-800 flex-wrap">
         <span className="text-white font-semibold text-sm">Floor Plan Editor</span>
         <div className="h-4 w-px bg-slate-700" />
 
+        {/* SVG upload */}
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".svg,.drawio"
+          className="hidden"
+          onChange={handleSvgUpload}
+        />
         <button
-          onClick={addRoom}
-          className="flex items-center gap-1 bg-slate-700 hover:bg-slate-600 text-white text-xs rounded-lg px-2 py-1.5"
-          title="Add a new room to the floor plan"
+          onClick={() => fileInputRef.current?.click()}
+          className="flex items-center gap-1 bg-blue-700 hover:bg-blue-600 text-white text-xs rounded-lg px-3 py-1.5 font-medium"
+          title="Upload a draw.io or SVG file as the floor plan"
         >
-          <Plus size={12} /> Add Room
+          <Upload size={12} />
+          {floorPlanSvg ? 'Replace Floor Plan' : 'Upload Floor Plan'}
         </button>
 
         <div className="h-4 w-px bg-slate-700" />
@@ -830,29 +487,27 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
               <input type="number" value={config.deltaSetpointMax} step={0.5} min={1}
                 onChange={e => setConfig(c => ({ ...c, deltaSetpointMax: parseFloat(e.target.value) || 4 }))}
                 className="ml-2 w-12 bg-slate-900 border border-slate-600 rounded px-1 py-0.5 text-white text-xs outline-none"
-              />
-              °C
+              />°C
             </label>
             <label className="text-xs text-slate-400">
               Zone deviation max
               <input type="number" value={config.localDeviationMax} step={0.5} min={0.5}
                 onChange={e => setConfig(c => ({ ...c, localDeviationMax: parseFloat(e.target.value) || 3 }))}
                 className="ml-2 w-12 bg-slate-900 border border-slate-600 rounded px-1 py-0.5 text-white text-xs outline-none"
-              />
-              °C
+              />°C
             </label>
           </div>
         )}
 
         {!allLiveSensors && (
-          <span className="text-xs text-yellow-400 ml-auto">Live sensor data not loaded — open Sensors tab first</span>
+          <span className="text-xs text-yellow-400 ml-auto">Live sensor data not loaded</span>
         )}
       </div>
 
       {/* ── Main content ── */}
       <div className="flex flex-1 overflow-hidden">
 
-        {/* ── Left sidebar (sensor palette) ── */}
+        {/* ── Left sidebar ── */}
         <div className="w-60 min-w-[15rem] bg-slate-900/40 border-r border-slate-800 flex flex-col overflow-y-auto">
           <div className="p-3 border-b border-slate-800">
             <span className="text-xs text-slate-400 uppercase font-semibold">Sensor Palette</span>
@@ -866,173 +521,110 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
             <p className="text-xs text-slate-500 mt-2">Drag sensors onto the floor plan to place them.</p>
           </div>
 
-          {/* Desk sensors */}
-          <SensorGroup
-            label="Desk Sensors"
-            color="#f97316"
-            sensors={sidebarSensors.desk}
-            classifiedType="desk"
-            zoneId={sidebarZoneId}
-            placedMap={placedMap}
-            dragSensorRef={dragSensorRef}
-            hotPocketMap={hotPocketMap}
-          />
+          <SensorGroup label="Desk Sensors" color="#f97316" sensors={sidebarSensors.desk}
+            classifiedType="desk" zoneId={sidebarZoneId} placedMap={placedMap}
+            dragSensorRef={dragSensorRef} hotPocketMap={hotPocketMap} />
 
-          {/* Ceiling / AC sensors */}
-          <SensorGroup
-            label="Ceiling / AC Sensors"
-            color="#22d3ee"
-            sensors={sidebarSensors.ceiling}
-            classifiedType="ceiling"
-            zoneId={sidebarZoneId}
-            placedMap={placedMap}
-            dragSensorRef={dragSensorRef}
-            hotPocketMap={hotPocketMap}
-          />
+          <SensorGroup label="Ceiling / AC Sensors" color="#22d3ee" sensors={sidebarSensors.ceiling}
+            classifiedType="ceiling" zoneId={sidebarZoneId} placedMap={placedMap}
+            dragSensorRef={dragSensorRef} hotPocketMap={hotPocketMap} />
         </div>
 
         {/* ── SVG Canvas ── */}
         <div className="flex-1 overflow-auto relative bg-slate-950">
-          <div style={{ position: 'relative', width: svgSize.width, height: svgSize.height }}>
+          <div style={{ position: 'relative', width: SVG_W, height: SVG_H }}>
 
             {/* Heatmap canvas overlay */}
-            <canvas
-              ref={heatmapRef}
-              width={svgSize.width}
-              height={svgSize.height}
-              style={{
-                position: 'absolute', top: 0, left: 0,
-                pointerEvents: 'none',
-                display: showHeatmap ? 'block' : 'none',
-              }}
-            />
+            <canvas ref={heatmapRef} width={SVG_W} height={SVG_H}
+              style={{ position: 'absolute', top: 0, left: 0, pointerEvents: 'none',
+                display: showHeatmap ? 'block' : 'none' }} />
 
-            <svg
-              ref={svgRef}
-              width={svgSize.width}
-              height={svgSize.height}
-              style={{ display: 'block' }}
-              onMouseMove={handleSvgMouseMoveForSensor}
-              onMouseUp={handleSvgMouseUpAll}
-              onMouseLeave={handleSvgMouseUpAll}
+            <svg ref={svgRef} width={SVG_W} height={SVG_H} style={{ display: 'block' }}
+              onMouseMove={handleSvgMouseMove}
+              onMouseUp={handleSvgMouseUp}
+              onMouseLeave={handleSvgMouseUp}
               onDragOver={handleCanvasDragOver}
               onDrop={handleCanvasDrop}
-              onClick={() => { setSelectedWall(null); setSelectedSensorKey(null); setEditingRoom(null); }}
+              onClick={() => { setSelectedWall(null); setSelectedSensorKey(null); }}
             >
-              {/* Floor plan background image */}
-              <image
-                href="/floor_plan.svg"
-                x={0} y={0}
-                width={CUSTOM_FP_W}
-                height={CUSTOM_FP_H}
-                preserveAspectRatio="xMidYMid meet"
-                style={{ pointerEvents: 'none' }}
-              />
+              {/* Canvas background */}
+              <rect width={SVG_W} height={SVG_H} fill="#0f172a" />
 
-              {/* Editable room outlines — transparent walls overlaid on the SVG */}
-              {customRooms.map(room => {
-                const cx = room.x + room.w / 2;
-                const cy = room.y + room.h / 2;
+              {/* ── Layer 1: Uploaded floor plan SVG (as-is) ── */}
+              {floorPlanSvg ? (
+                <image
+                  href={floorPlanSvg}
+                  x={0} y={0}
+                  width={SVG_W} height={SVG_H}
+                  preserveAspectRatio="xMidYMid meet"
+                  style={{ pointerEvents: 'none' }}
+                />
+              ) : (
+                <text x={SVG_W / 2} y={SVG_H / 2}
+                  textAnchor="middle" dominantBaseline="middle"
+                  fill="#475569" fontSize={16}
+                  style={{ pointerEvents: 'none', userSelect: 'none' }}>
+                  Upload a floor plan to get started
+                </text>
+              )}
 
-                type Side = 'top' | 'right' | 'bottom' | 'left';
-                const sides: Array<{
-                  side: Side; x1: number; y1: number; x2: number; y2: number;
-                  edge: 'w' | 'h'; midX: number; midY: number;
-                  labelX: number; labelY: number; anchor: string; cursor: string;
-                }> = [
-                  { side: 'top',    x1: room.x,        y1: room.y,        x2: room.x+room.w, y2: room.y,        edge: 'w', midX: cx,            midY: room.y,        labelX: cx,            labelY: room.y-8,        anchor: 'middle', cursor: 'ns-resize' },
-                  { side: 'bottom', x1: room.x,        y1: room.y+room.h, x2: room.x+room.w, y2: room.y+room.h, edge: 'w', midX: cx,            midY: room.y+room.h, labelX: cx,            labelY: room.y+room.h+12, anchor: 'middle', cursor: 'ns-resize' },
-                  { side: 'left',   x1: room.x,        y1: room.y,        x2: room.x,        y2: room.y+room.h, edge: 'h', midX: room.x,        midY: cy,            labelX: room.x-6,      labelY: cy,              anchor: 'end',    cursor: 'ew-resize' },
-                  { side: 'right',  x1: room.x+room.w, y1: room.y,        x2: room.x+room.w, y2: room.y+room.h, edge: 'h', midX: room.x+room.w, midY: cy,            labelX: room.x+room.w+6, labelY: cy,            anchor: 'start',  cursor: 'ew-resize' },
-                ];
-
+              {/* ── Layer 2: Transparent wall hit-targets + hover highlights ── */}
+              {floorPlanSvg && svgWalls.map(wall => {
+                const isHov  = hoveredWallId === wall.id;
+                const midX   = (wall.x1 + wall.x2) / 2;
+                const midY   = (wall.y1 + wall.y2) / 2;
+                const lenPx  = wallOverrides[wall.id] ?? wall.lengthPx;
+                const isHoriz = Math.abs(wall.y2 - wall.y1) < Math.abs(wall.x2 - wall.x1);
                 return (
-                  <g key={room.id}>
-                    {/* Room label — drag to move the room */}
-                    <text
-                      x={cx} y={cy}
-                      textAnchor="middle" dominantBaseline="middle"
-                      fill="#94a3b8" fontSize={10} fontWeight="500"
-                      style={{ cursor: 'move', userSelect: 'none' }}
-                      onMouseDown={e => {
-                        e.stopPropagation();
-                        const cur = svgCoordsFromEvent(e as any);
-                        roomDragRef.current = {
-                          roomId: room.id, startSvgX: cur.x, startSvgY: cur.y,
-                          startRoomX: room.x, startRoomY: room.y,
-                        };
-                      }}
-                    >
-                      {room.label}
-                    </text>
-
-                    {/* Wall sides — each is independently hoverable and clickable */}
-                    {sides.map(s => {
-                      const isHov = hoveredRoomWall?.roomId === room.id && hoveredRoomWall?.side === s.side;
-                      const lenM  = (s.edge === 'w' ? room.w : room.h) / SCALE;
-                      return (
-                        <g key={s.side}>
-                          {/* Invisible wide hit target */}
-                          <line
-                            x1={s.x1} y1={s.y1} x2={s.x2} y2={s.y2}
-                            stroke="transparent" strokeWidth={12}
-                            style={{ cursor: s.cursor }}
-                            onMouseEnter={() => setHoveredRoomWall({ roomId: room.id, side: s.side })}
-                            onMouseLeave={() => setHoveredRoomWall(null)}
-                            onClick={e => {
-                              e.stopPropagation();
-                              setEditingRoom({ id: room.id, edge: s.edge, value: s.edge === 'w' ? room.w : room.h, svgX: s.midX, svgY: s.midY });
-                            }}
-                          />
-                          {/* Visible wall line */}
-                          <line
-                            x1={s.x1} y1={s.y1} x2={s.x2} y2={s.y2}
-                            stroke={isHov ? '#3b82f6' : '#64748b'}
-                            strokeWidth={isHov ? 3 : 1.5}
-                            style={{ pointerEvents: 'none' }}
-                          />
-                          {/* Dimension label — shown on hover */}
-                          {isHov && (
-                            <text
-                              x={s.labelX} y={s.labelY}
-                              textAnchor={s.anchor} dominantBaseline="middle"
-                              fill="#93c5fd" fontSize={9} fontWeight="600"
-                              style={{ pointerEvents: 'none', userSelect: 'none' }}
-                            >
-                              {lenM.toFixed(2)} m
-                            </text>
-                          )}
-                        </g>
-                      );
-                    })}
+                  <g key={wall.id}>
+                    {/* Wide invisible hit target */}
+                    <line
+                      x1={wall.x1} y1={wall.y1} x2={wall.x2} y2={wall.y2}
+                      stroke="transparent" strokeWidth={14}
+                      style={{ cursor: 'pointer' }}
+                      onMouseEnter={() => setHoveredWallId(wall.id)}
+                      onMouseLeave={() => setHoveredWallId(null)}
+                      onClick={e => { e.stopPropagation(); setSelectedWall({ wall, svgX: midX, svgY: midY }); }}
+                    />
+                    {/* Visible blue highlight on hover */}
+                    {isHov && (
+                      <line x1={wall.x1} y1={wall.y1} x2={wall.x2} y2={wall.y2}
+                        stroke="#3b82f6" strokeWidth={3} opacity={0.75}
+                        style={{ pointerEvents: 'none' }} />
+                    )}
+                    {/* Dimension label on hover */}
+                    {isHov && (
+                      <text
+                        x={isHoriz ? midX : midX - 10}
+                        y={isHoriz ? midY - 10 : midY}
+                        textAnchor="middle" dominantBaseline="middle"
+                        fill="#93c5fd" fontSize={9} fontWeight="600"
+                        style={{ pointerEvents: 'none', userSelect: 'none' }}>
+                        {(lenPx / SCALE).toFixed(2)} m
+                      </text>
+                    )}
                   </g>
                 );
               })}
 
-              {/* Placed sensors */}
+              {/* ── Layer 3: Placed sensors ── */}
               {floorPlan.sensors.map(sp => {
-                const off    = sp.isCustomMode ? { offsetX: 0, offsetY: 0 } : getOffset(sp.zoneId);
-                const svgX   = (off.offsetX + sp.x) * SCALE;
-                const svgY   = (off.offsetY + sp.y) * SCALE;
-                const score  = hotPocketMap.get(sp.sensorKey);
-                const color  = sp.role === 'excluded'  ? '#475569'
-                             : sp.role === 'supply_air' ? '#7c3aed'
-                             : sp.classifiedType === 'ceiling' ? '#22d3ee'
-                             : score?.color ?? '#f97316';
+                const svgX  = sp.x * SCALE;
+                const svgY  = sp.y * SCALE;
+                const score = hotPocketMap.get(sp.sensorKey);
+                const color = sp.role === 'excluded'  ? '#475569'
+                            : sp.role === 'supply_air' ? '#7c3aed'
+                            : sp.classifiedType === 'ceiling' ? '#22d3ee'
+                            : score?.color ?? '#f97316';
                 const isSelected = selectedSensorKey === sp.sensorKey;
-
                 return (
-                  <g
-                    key={sp.sensorKey}
-                    style={{ cursor: 'pointer' }}
-                    onMouseDown={e => handlePlacedSensorMouseDown(e, sp.sensorKey, sp.zoneId)}
+                  <g key={sp.sensorKey} style={{ cursor: 'pointer' }}
+                    onMouseDown={e => { e.stopPropagation(); placedSensorDragRef.current = { key: sp.sensorKey }; }}
                     onClick={e => { e.stopPropagation(); setSelectedSensorKey(sp.sensorKey); }}
                   >
-                    {/* Pulsing ring for hot pockets */}
                     {score && score.score > 0.65 && (
                       <circle cx={svgX} cy={svgY} r={14} fill="none"
-                        stroke="#ef4444" strokeWidth={1.5} opacity={0.6}
-                        strokeDasharray="4,2">
+                        stroke="#ef4444" strokeWidth={1.5} opacity={0.6} strokeDasharray="4,2">
                         <animate attributeName="r" values="12;18;12" dur="2s" repeatCount="indefinite" />
                         <animate attributeName="opacity" values="0.6;0.2;0.6" dur="2s" repeatCount="indefinite" />
                       </circle>
@@ -1042,11 +634,9 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
                         fill={color} stroke={isSelected ? '#fff' : '#0f172a'} strokeWidth={isSelected ? 2 : 1} />
                     ) : (
                       <polygon
-                        points={`${svgX},${svgY - 8} ${svgX + 7},${svgY + 5} ${svgX - 7},${svgY + 5}`}
-                        fill={color} stroke={isSelected ? '#fff' : '#0f172a'} strokeWidth={isSelected ? 2 : 1}
-                      />
+                        points={`${svgX},${svgY-8} ${svgX+7},${svgY+5} ${svgX-7},${svgY+5}`}
+                        fill={color} stroke={isSelected ? '#fff' : '#0f172a'} strokeWidth={isSelected ? 2 : 1} />
                     )}
-                    {/* Airflow direction arrow for ceiling sensors */}
                     {sp.classifiedType === 'ceiling' && sp.flowDirection !== undefined && (
                       <line
                         x1={svgX} y1={svgY}
@@ -1071,6 +661,17 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
                 </marker>
               </defs>
             </svg>
+
+            {/* Wall edit popover (positioned absolutely over SVG) */}
+            {selectedWall && (
+              <WallEditPopover
+                wallLength={(wallOverrides[selectedWall.wall.id] ?? selectedWall.wall.lengthPx) / SCALE}
+                svgX={selectedWall.svgX}
+                svgY={selectedWall.svgY}
+                onSave={len => { saveWallOverride(selectedWall.wall.id, len * SCALE); setSelectedWall(null); }}
+                onClose={() => setSelectedWall(null)}
+              />
+            )}
           </div>
         </div>
 
@@ -1084,7 +685,6 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
               </button>
             </div>
 
-            {/* Live temp */}
             {selectedLiveData && (
               <div className="bg-slate-800 rounded-xl p-3 text-center">
                 <span className="text-2xl font-bold text-white">{selectedLiveData.temp.toFixed(1)}°C</span>
@@ -1092,52 +692,40 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
               </div>
             )}
 
-            {/* Hot pocket score (desk sensors only) */}
             {selectedScore && (
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <span className="text-xs text-slate-400">Hot pocket score</span>
-                  <span
-                    className="text-xs font-bold px-2 py-0.5 rounded-full"
-                    style={{ backgroundColor: selectedScore.color + '33', color: selectedScore.color }}
-                  >
+                  <span className="text-xs font-bold px-2 py-0.5 rounded-full"
+                    style={{ backgroundColor: selectedScore.color + '33', color: selectedScore.color }}>
                     {(selectedScore.score * 100).toFixed(0)}% · {selectedScore.label}
                   </span>
                 </div>
                 <div className="h-2 bg-slate-700 rounded-full overflow-hidden">
-                  <div
-                    className="h-full rounded-full transition-all"
-                    style={{ width: `${selectedScore.score * 100}%`, backgroundColor: selectedScore.color }}
-                  />
+                  <div className="h-full rounded-full transition-all"
+                    style={{ width: `${selectedScore.score * 100}%`, backgroundColor: selectedScore.color }} />
                 </div>
                 <div className="grid grid-cols-2 gap-2 mt-2">
-                  <Metric label="Δ Setpoint" value={`+${selectedScore.deltaSetpoint.toFixed(1)}°C`}
-                    note="vs AC target" />
-                  <Metric label="Zone outlier" value={`+${selectedScore.localDeviation.toFixed(1)}°C`}
-                    note="vs zone mean" />
+                  <Metric label="Δ Setpoint" value={`+${selectedScore.deltaSetpoint.toFixed(1)}°C`} note="vs AC target" />
+                  <Metric label="Zone outlier" value={`+${selectedScore.localDeviation.toFixed(1)}°C`} note="vs zone mean" />
                 </div>
               </div>
             )}
 
-            {/* Position */}
             <div className="space-y-2">
               <span className="text-xs text-slate-400 uppercase font-semibold">Position (m)</span>
               <div className="grid grid-cols-2 gap-2">
                 <label className="flex flex-col gap-1">
-                  <span className="text-xs text-slate-500">X (east)</span>
-                  <input type="number" step="0.1"
-                    value={selectedSensor.x}
+                  <span className="text-xs text-slate-500">X</span>
+                  <input type="number" step="0.1" value={selectedSensor.x}
                     onChange={e => updateSensorPosition(selectedSensor.sensorKey, parseFloat(e.target.value) || 0, selectedSensor.y)}
-                    className="bg-slate-800 border border-slate-700 rounded-lg px-2 py-1 text-white text-xs outline-none focus:border-blue-500"
-                  />
+                    className="bg-slate-800 border border-slate-700 rounded-lg px-2 py-1 text-white text-xs outline-none focus:border-blue-500" />
                 </label>
                 <label className="flex flex-col gap-1">
-                  <span className="text-xs text-slate-500">Y (south)</span>
-                  <input type="number" step="0.1"
-                    value={selectedSensor.y}
+                  <span className="text-xs text-slate-500">Y</span>
+                  <input type="number" step="0.1" value={selectedSensor.y}
                     onChange={e => updateSensorPosition(selectedSensor.sensorKey, selectedSensor.x, parseFloat(e.target.value) || 0)}
-                    className="bg-slate-800 border border-slate-700 rounded-lg px-2 py-1 text-white text-xs outline-none focus:border-blue-500"
-                  />
+                    className="bg-slate-800 border border-slate-700 rounded-lg px-2 py-1 text-white text-xs outline-none focus:border-blue-500" />
                 </label>
               </div>
               {acDistances && (
@@ -1150,20 +738,15 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
               )}
             </div>
 
-            {/* Role */}
             <div className="space-y-1">
               <span className="text-xs text-slate-400 uppercase font-semibold">Sensor Role</span>
               <div className="flex flex-col gap-1">
                 {(['normal', 'supply_air', 'excluded'] as const).map(role => (
-                  <button
-                    key={role}
+                  <button key={role}
                     onClick={() => updateSensorRole(selectedSensor.sensorKey, role)}
                     className={`text-xs text-left px-3 py-1.5 rounded-lg transition-colors ${
-                      selectedSensor.role === role
-                        ? 'bg-blue-600 text-white'
-                        : 'bg-slate-800 text-slate-400 hover:text-white'
-                    }`}
-                  >
+                      selectedSensor.role === role ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'
+                    }`}>
                     {role === 'normal'     && 'Normal (included in analysis)'}
                     {role === 'supply_air' && 'Supply Air (inside AC duct)'}
                     {role === 'excluded'   && 'Excluded (ignore this sensor)'}
@@ -1172,21 +755,15 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
               </div>
             </div>
 
-            {/* Flow direction (ceiling sensors) */}
             {selectedSensor.classifiedType === 'ceiling' && (
               <div className="space-y-2">
                 <span className="text-xs text-slate-400 uppercase font-semibold">AC Airflow Direction</span>
                 <div className="grid grid-cols-4 gap-1">
                   {DIRECTIONS_8.map(d => (
-                    <button
-                      key={d.deg}
-                      onClick={() => updateSensorFlow(selectedSensor.sensorKey, d.deg)}
+                    <button key={d.deg} onClick={() => updateSensorFlow(selectedSensor.sensorKey, d.deg)}
                       className={`text-xs py-1 rounded-lg transition-colors ${
-                        selectedSensor.flowDirection === d.deg
-                          ? 'bg-blue-600 text-white'
-                          : 'bg-slate-800 text-slate-400 hover:text-white'
-                      }`}
-                    >
+                        selectedSensor.flowDirection === d.deg ? 'bg-blue-600 text-white' : 'bg-slate-800 text-slate-400 hover:text-white'
+                      }`}>
                       {d.label}
                     </button>
                   ))}
@@ -1194,11 +771,8 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
               </div>
             )}
 
-            {/* Remove button */}
-            <button
-              onClick={() => removePlacedSensor(selectedSensor.sensorKey)}
-              className="flex items-center gap-1 text-xs text-red-400 hover:text-red-300 hover:bg-red-900/20 rounded-lg px-2 py-1.5 transition-colors"
-            >
+            <button onClick={() => removePlacedSensor(selectedSensor.sensorKey)}
+              className="flex items-center gap-1 text-xs text-red-400 hover:text-red-300 hover:bg-red-900/20 rounded-lg px-2 py-1.5 transition-colors">
               <Trash2 size={12} /> Remove from floor plan
             </button>
           </div>
@@ -1209,7 +783,7 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
       <div className="flex items-center gap-4 px-4 py-2 bg-slate-900/60 border-t border-slate-800 text-xs text-slate-400 flex-wrap">
         <span className="font-semibold text-slate-300">Legend:</span>
         {[
-          { color: '#3b82f6', label: 'Cool (score <25%)' },
+          { color: '#3b82f6', label: 'Cool (<25%)' },
           { color: '#22c55e', label: 'OK (25–45%)' },
           { color: '#f97316', label: 'Warm (45–65%)' },
           { color: '#ef4444', label: 'Hot Pocket (>65%)' },
@@ -1221,7 +795,7 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         ))}
         <span className="ml-2">● Desk sensor</span>
         <span>▲ Ceiling / AC sensor</span>
-        <span className="text-purple-400">▲ Supply air sensor</span>
+        <span className="text-slate-500">Hover a wall to see / click to edit its dimension</span>
       </div>
 
       {/* ── Modals ── */}
@@ -1231,94 +805,18 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
           onSkip={() => setPendingFlowSensorKey(null)}
         />
       )}
-
-      {editingRoom && (
-        <RoomDimPopover
-          label={editingRoom.edge === 'w' ? 'Wall Width' : 'Wall Height'}
-          valuePx={editingRoom.value}
-          svgX={editingRoom.svgX}
-          svgY={editingRoom.svgY}
-          onSave={px => { updateRoomDimension(editingRoom.id, editingRoom.edge, px); setEditingRoom(null); }}
-          onClose={() => setEditingRoom(null)}
-          onDelete={() => { deleteRoom(editingRoom.id); setEditingRoom(null); }}
-        />
-      )}
     </div>
   );
 };
 
-// ── helper sub-components ──────────────────────────────────────────────────
-
-/** Popover for editing a room wall dimension in metres. */
-function RoomDimPopover({
-  label,
-  valuePx,
-  svgX,
-  svgY,
-  onSave,
-  onClose,
-  onDelete,
-}: {
-  label: string;
-  valuePx: number;
-  svgX: number;
-  svgY: number;
-  onSave: (px: number) => void;
-  onClose: () => void;
-  onDelete?: () => void;
-}) {
-  const [val, setVal] = useState((valuePx / SCALE).toFixed(2));
-  return (
-    <div
-      style={{ position: 'absolute', left: svgX + 8, top: Math.max(0, svgY - 60), zIndex: 50 }}
-      className="bg-slate-800 border border-slate-600 rounded-xl shadow-xl p-3 flex flex-col gap-2 w-52"
-    >
-      <div className="flex items-center justify-between">
-        <span className="text-xs text-slate-400 font-semibold uppercase">{label}</span>
-        <button onClick={onClose} className="text-slate-500 hover:text-white"><X size={12} /></button>
-      </div>
-      <div className="flex items-center gap-1">
-        <input
-          type="number"
-          value={val}
-          step="0.1"
-          min="0.2"
-          onChange={e => setVal(e.target.value)}
-          className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white text-sm outline-none focus:border-blue-500"
-          autoFocus
-          onKeyDown={e => { if (e.key === 'Enter') onSave((parseFloat(val) || 1) * SCALE); }}
-        />
-        <span className="text-slate-400 text-xs">m</span>
-      </div>
-      <div className="flex gap-2">
-        <button
-          onClick={() => onSave((parseFloat(val) || 1) * SCALE)}
-          className="flex-1 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded-lg py-1 font-medium"
-        >
-          Save
-        </button>
-        {onDelete && (
-          <button
-            onClick={onDelete}
-            className="px-2 py-1 text-red-400 hover:text-red-300 hover:bg-red-900/30 rounded-lg"
-            title="Delete this room"
-          >
-            <Trash2 size={12} />
-          </button>
-        )}
-      </div>
-    </div>
-  );
-}
+// ── helper sub-components ─────────────────────────────────────────────────────
 
 function SensorGroup({
   label, color, sensors, classifiedType, zoneId, placedMap, dragSensorRef, hotPocketMap,
 }: {
-  label: string;
-  color: string;
+  label: string; color: string;
   sensors: Array<{ key: string; name: string; temp: number; setpoint: number | null }>;
-  classifiedType: 'desk' | 'ceiling';
-  zoneId: string;
+  classifiedType: 'desk' | 'ceiling'; zoneId: string;
   placedMap: Map<string, SensorPlacement>;
   dragSensorRef: React.MutableRefObject<any>;
   hotPocketMap: Map<string, HotPocketScore>;
@@ -1335,16 +833,10 @@ function SensorGroup({
         const isPlaced = placedMap.has(s.key);
         const score    = hotPocketMap.get(s.key);
         return (
-          <div
-            key={s.key}
-            draggable
-            onDragStart={() => {
-              dragSensorRef.current = { key: s.key, name: s.name, classifiedType, zoneId };
-            }}
+          <div key={s.key} draggable
+            onDragStart={() => { dragSensorRef.current = { key: s.key, name: s.name, classifiedType, zoneId }; }}
             onDragEnd={() => { dragSensorRef.current = null; }}
-            className={`flex items-center justify-between px-3 py-2 cursor-grab hover:bg-slate-800/60 transition-colors ${
-              isPlaced ? 'opacity-50' : ''
-            }`}
+            className={`flex items-center justify-between px-3 py-2 cursor-grab hover:bg-slate-800/60 transition-colors ${isPlaced ? 'opacity-50' : ''}`}
             title={isPlaced ? 'Already placed — drag again to move' : 'Drag to place on floor plan'}
           >
             <div className="flex items-center gap-2 min-w-0">
@@ -1358,9 +850,7 @@ function SensorGroup({
               <span className="text-xs text-slate-200 truncate">{s.name}</span>
             </div>
             <div className="flex items-center gap-1 flex-shrink-0">
-              {score && (
-                <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: score.color }} />
-              )}
+              {score && <div className="w-1.5 h-1.5 rounded-full" style={{ backgroundColor: score.color }} />}
               <span className="text-xs text-slate-400">{s.temp.toFixed(1)}°</span>
             </div>
           </div>
