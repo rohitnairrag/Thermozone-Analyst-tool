@@ -1,6 +1,10 @@
-import { ZoneParams, ACUnit, SimulationResult, SimulationDataPoint, HourlyWeather, InternalLoadItem } from '../types';
+import { ZoneParams, ACUnit, SimulationResult, SimulationDataPoint, HourlyWeather, InternalLoadItem, ZoneTransferEntry } from '../types';
 import { computeFloorArea } from './geometry';
 import { computeScheduledInternalLoads } from './internalLoadScheduler';
+
+// Shared envelope U-values (W/m²·K) — imported by HeatFlowDiagram to keep constants in sync
+export const U_GLASS = 2.7;  // double-glazed tinted glass
+export const U_WALL  = 1.8;  // brick/block wall, no insulation
 
 export const calculateHeatLoad = (
   zone: ZoneParams,
@@ -10,15 +14,27 @@ export const calculateHeatLoad = (
   lon: number = 77.5946,
   realIndoorTemps: number[] | null = null,        // 24-element array from DB (index = hour); overrides simulated indoor temp
   realAcOutputsWatts: number[] | null = null,     // 24-element array from DB (index = hour); total zone AC electrical watts
-  internalLoadItems?: InternalLoadItem[]          // optional per-unit inventory; replaces W/m² density method when provided
+  internalLoadItems?: InternalLoadItem[],         // optional per-unit inventory; replaces W/m² density method when provided
+  adjacentZoneTemps: Record<string, number[]> | null = null,  // zoneId → 24-hr temp array for adjacent zone heat transfer
+  initialTempC: number | null = null,             // real starting indoor temp (e.g. yesterday's last sensor reading); overrides the 24°C default
 ): SimulationResult => {
   if (!weather || !weather.temperature) {
     throw new Error("Weather data missing from API.");
   }
 
-  const totalRatedCapacity = acList.reduce((sum, ac) => sum + ac.ratedCapacityWatts, 0);
-  // Weighted-average ISEER across all ACs — used to convert real electrical input → cooling output
-  const avgISEER = acList.length > 0 ? acList.reduce((s, ac) => s + ac.iseer, 0) / acList.length : 3.5;
+  // ── Age-based degradation ────────────────────────────────────────────────
+  // Split ACs lose ~2% capacity per year due to refrigerant migration, compressor wear
+  // and coil fouling. Maximum degradation capped at 30% (i.e. floor at 0.70).
+  // Applied to both rated capacity and ISEER (efficiency degrades at the same rate).
+  const getAgeFactor = (ageYears: number) => Math.max(0.70, 1 - ageYears * 0.02);
+
+  const totalRatedCapacity = acList.reduce(
+    (sum, ac) => sum + ac.ratedCapacityWatts * getAgeFactor(ac.ageYears), 0
+  );
+  // Weighted-average effective ISEER — used to convert real electrical input → cooling output
+  const avgISEER = acList.length > 0
+    ? acList.reduce((s, ac) => s + ac.iseer * getAgeFactor(ac.ageYears), 0) / acList.length
+    : 3.70;  // BEE 3-star minimum (3.70–3.99); fallback when no AC units configured
 
   const areaM2 = computeFloorArea(zone.walls);
   const roomVolumeM3 = areaM2 * zone.ceilingHeightM;
@@ -36,12 +52,11 @@ export const calculateHeatLoad = (
   const GROUND_REFLECTANCE = 0.2;
   const FRAME_FACTOR = 0.85;
   const SHGC = 0.3;
-  const U_GLASS = 2.7;
-  const U_WALL = 1.8;
   const U_ROOF = 1.5;
   const ALPHA_WALL = 0.6;
   const ALPHA_ROOF = 0.8;
-  const H_OUT = 20;
+  const H_OUT_MIN = 10;    // still-air floor (W/m²K)
+  const EPSILON_ROOF = 0.9; // long-wave emissivity — most roofing/wall materials
   const THERMAL_MASS_FACTOR = 0.7;
 
   // Infiltration & Internal Gain Constants
@@ -91,35 +106,63 @@ export const calculateHeatLoad = (
     return 0.2;
   };
 
-  // Simulation State
+  // Simulation State — 1-minute resolution (1440 slots per day)
+  // slot 0 = 00:00, slot 1 = 00:01, slot 2 = 00:02, …, slot 1439 = 23:59
   const RTS = [0.35, 0.25, 0.20, 0.12, 0.08];
   const wallHistory: number[] = [];
   const roofHistory: number[] = [];
   const solarHistory: number[] = [];
   const data: SimulationDataPoint[] = [];
 
-  // Use the first real reading as starting temp if available, else default to 24°C
-  let currentIndoorTemp = (realIndoorTemps && realIndoorTemps[0] != null) ? realIndoorTemps[0] : 24.0;
+  // Starting indoor temperature priority:
+  //   1. initialTempC — explicitly supplied (e.g. yesterday's last DB sensor reading)
+  //   2. realIndoorTemps[0] — first hour of today's sensor data (Path A anchor)
+  //   3. 24.0°C hardcoded fallback (worst case — causes systematic cold-start bias)
+  let currentIndoorTemp = initialTempC
+    ?? (realIndoorTemps && realIndoorTemps[0] != null ? realIndoorTemps[0] : 24.0);
   let totalTempSum = 0;
   let maxTemp = 0;
   let peakLoadWatts = 0;
   let peakLoadTime = '';
   let peakPerformanceFactor = 1;
-  let acOutputAtPeakLoad = 0;   // actual AC output (watts) at the hour peak load occurs
+  let acOutputAtPeakLoad = 0;   // actual AC output (watts) at the slot where peak load occurs
 
-  const roomThermalMassJperK = areaM2 * 50000;
-  const thermalMassWatts = roomThermalMassJperK / 3600;
-  const LATENT_HEAT_FACTOR = 1.45;
+  // ── Thermal mass ─────────────────────────────────────────────────────────
+  // Medium-weight construction (concrete frame, screed floor, block/brick walls) —
+  // typical for a Bangalore commercial office building.
+  //   Lightweight (plasterboard / raised floor): ~50,000 J/(m²·K)
+  //   Medium  (concrete frame, block walls):    ~150,000 J/(m²·K)  ← used here
+  //   Heavyweight (exposed concrete / brick):   ~300,000 J/(m²·K)
+  // Used in the energy-balance temperature simulation: ΔT = Q_net × Δt / C
+  const SLOT_SECONDS = 60;                          // 1-minute slot = 60 s
+  const roomThermalMassJperK = areaM2 * 150_000;   // J/K
 
-  for (let hour = 0; hour < 24; hour++) {
-    const outdoorTemp = weather.temperature[hour];
-    const outdoorRH = weather.relativeHumidity[hour];
-    const dni = weather.directRadiation[hour];
-    const dhi = weather.diffuseRadiation[hour];
-    const ghi = weather.shortwaveRadiation[hour];
+  for (let slot = 0; slot < 1440; slot++) {
+    // Fractional hour: 0, 1/60, 2/60, …, 1439/60 (= 23.983)
+    const fracHour = slot / 60;
+    const h0 = Math.floor(fracHour);                  // integer hour index into weather arrays
+    const h1 = Math.min(h0 + 1, 23);                  // next hour (clamped to 23)
+    const frac = fracHour - h0;                        // 0…0.917 — interpolation weight
 
-    // Solar Geometry
-    const H = 15 * (hour - 12) * Math.PI / 180;
+    // ── Linearly interpolate all weather values between the two bounding hours ──
+    const lerp = (a: number, b: number) => a * (1 - frac) + b * frac;
+    const outdoorTemp = lerp(weather.temperature[h0],      weather.temperature[h1]);
+    const outdoorRH   = lerp(weather.relativeHumidity[h0], weather.relativeHumidity[h1]);
+    const dni         = lerp(weather.directRadiation[h0],  weather.directRadiation[h1]);
+    const dhi         = lerp(weather.diffuseRadiation[h0], weather.diffuseRadiation[h1]);
+    const ghi         = lerp(weather.shortwaveRadiation[h0], weather.shortwaveRadiation[h1]);
+
+    // ── Dynamic outdoor convection coefficient (ASHRAE McAdams formula) ──────
+    // H_OUT rises with wind speed: faster wind → walls lose/gain heat more rapidly.
+    // During rain/storms wind is typically 5–10 m/s → H_OUT ~25–45 W/m²K vs the
+    // old hardcoded 20.  Falls back to H_OUT_MIN (10) when no wind data available.
+    const windSpeedMs = weather.windspeed
+      ? lerp(weather.windspeed[h0] ?? 3, weather.windspeed[h1] ?? 3)
+      : 3;  // 3 m/s default if API didn't return wind data
+    const H_OUT = Math.max(H_OUT_MIN, 5.8 + 3.94 * windSpeedMs);
+
+    // ── Solar Geometry (use fractional hour for accurate sun position) ──
+    const H = 15 * (fracHour - 12) * Math.PI / 180;
     const sinAlpha = Math.sin(phi) * Math.sin(delta) + Math.cos(phi) * Math.cos(delta) * Math.cos(H);
     const alpha = Math.asin(Math.max(-1, Math.min(1, sinAlpha)));
 
@@ -132,10 +175,18 @@ export const calculateHeatLoad = (
     }
 
     const iRoof = alpha > 0 ? (dni * Math.sin(alpha) + dhi) : 0;
-    const tSolairRoof = outdoorTemp + (ALPHA_ROOF * iRoof / H_OUT);
+    // Long-wave sky correction: clear sky radiates ~63 W/m² away from roof (cooling effect).
+    // Under cloud/rain the sky acts as a warm blanket → ΔR → 0.
+    // Use GHI fraction of clear-sky maximum as a cloud proxy (0 = fully overcast, 1 = clear).
+    const clearSkyFraction = alpha > 0.05
+      ? Math.min(1, ghi / Math.max(1, dni * Math.sin(alpha) + dhi))
+      : 0;
+    const deltaR = 63 * clearSkyFraction;
+    const tSolairRoof = outdoorTemp + (ALPHA_ROOF * iRoof / H_OUT) - (EPSILON_ROOF * deltaR / H_OUT);
 
+    // Set-point and working hours use integer hour
     let stepSetPoint = 24;
-    if (hour >= 10 && hour <= 17) stepSetPoint = 23;
+    if (h0 >= 10 && h0 <= 17) stepSetPoint = 23;
 
     let solar = 0;
     let glass = 0;
@@ -144,35 +195,33 @@ export const calculateHeatLoad = (
     let inf = 0;
     let internalEquipment = 0;
     let people = 0;
-    const other = 0;
+    let other = 0;
+    const slotTransfers: ZoneTransferEntry[] = [];
 
     // 1. Infiltration Load
     const hOut = getEnthalpy(outdoorTemp, outdoorRH);
     const hInDynamic = getEnthalpy(currentIndoorTemp, 50);
     const qInf = massFlowRate * (hOut - hInDynamic) * 1000;
-    inf += Math.max(0, qInf);
+    inf += qInf;
 
-    // 2. Internal Gains
-    // Use inventory-based scheduled loads when an item list is provided;
-    // otherwise fall back to the generic W/m² density estimates.
+    // 2. Internal Gains — schedule lookup uses integer hour (h0)
     if (internalLoadItems && internalLoadItems.length > 0) {
       // ── Inventory / scheduled approach ────────────────────────────────────
-      // Each item contributes: count × wattsPerUnit × schedulePreset(hour)
-      const sched = computeScheduledInternalLoads(internalLoadItems, hour);
-      people           += sched.people;
+      const sched = computeScheduledInternalLoads(internalLoadItems, h0);
+      people            += sched.people;
       internalEquipment += sched.lighting + sched.equipment + sched.appliance;
     } else {
       // ── Density-based fallback (generic W/m²) ────────────────────────────
-      const nPeople = maxPeople * getOccupancyFactor(hour);
-      people           += nPeople * PEOPLE_TOTAL_HEAT;
-      internalEquipment += LIGHTING_DENSITY * areaM2 * getLightingFactor(hour);
-      internalEquipment += EQUIPMENT_DENSITY * areaM2 * getEquipmentFactor(hour);
+      const nPeople = maxPeople * getOccupancyFactor(h0);
+      people            += nPeople * PEOPLE_TOTAL_HEAT;
+      internalEquipment += LIGHTING_DENSITY * areaM2 * getLightingFactor(h0);
+      internalEquipment += EQUIPMENT_DENSITY * areaM2 * getEquipmentFactor(h0);
     }
 
     // 3. Roof (Top Floor only)
     if (zone.isTopFloor) {
       const qRoof = U_ROOF * areaM2 * (tSolairRoof - currentIndoorTemp);
-      roof += Math.max(0, qRoof);
+      roof += qRoof;
     }
 
     // 4. Window Solar Gain & Wall Conduction
@@ -181,13 +230,38 @@ export const calculateHeatLoad = (
     const hourWindowDebug: Record<string, { azimuth: number; cosTheta: number; incidentRadiation: number; solarGain: number }> = {};
 
     walls.forEach(wDef => {
-      // Internal walls: both sides are conditioned — skip solar gain, negligible conduction delta
-      if (wDef.wallType === 'internal') return;
+      if (wDef.wallType === 'internal') {
+        // Heat conduction through shared partition into/from the adjacent zone
+        if (adjacentZoneTemps && wDef.adjacentZoneId) {
+          const adjTemps = adjacentZoneTemps[wDef.adjacentZoneId];
+          if (adjTemps) {
+            const adjTemp = adjTemps[h0] ?? currentIndoorTemp;
+            const totalArea = wDef.lengthM * zone.ceilingHeightM;
+            // Weighted U-value: split wall into glass and opaque portions using measured glassAreaM2
+            let uEffective: number;
+            if (wDef.constructionType === 'full_glass') {
+              uEffective = U_GLASS;
+            } else if (wDef.constructionType === 'mixed' && wDef.glassAreaM2 != null && wDef.glassAreaM2 > 0) {
+              const glassArea  = Math.min(wDef.glassAreaM2, totalArea);
+              const opaqueArea = Math.max(0, totalArea - glassArea);
+              uEffective = (U_GLASS * glassArea + U_WALL * opaqueArea) / totalArea;
+            } else if (wDef.constructionType === 'mixed') {
+              uEffective = (U_WALL + U_GLASS) / 2;  // fallback: no glassAreaM2 provided
+            } else {
+              uEffective = U_WALL;
+            }
+            // Positive → heat flowing into this zone (adjacent is hotter); negative → heat leaving
+            const transferWatts = uEffective * totalArea * (adjTemp - currentIndoorTemp);
+            other += transferWatts;
+            slotTransfers.push({ wallId: wDef.id, adjacentZoneId: wDef.adjacentZoneId!, watts: transferWatts });
+          }
+        }
+        return;
+      }
 
       const totalWallArea = wDef.lengthM * zone.ceilingHeightM;
 
       if (wDef.constructionType === 'full_glass') {
-        // Entire wall face is glazing (e.g. glass facade)
         const gammaS = sunAzimuthDeg * Math.PI / 180;
         const gammaW = wDef.azimuth * Math.PI / 180;
         const cosTheta = Math.max(0, Math.cos(alpha) * Math.cos(gammaS - gammaW));
@@ -198,14 +272,13 @@ export const calculateHeatLoad = (
         const qSolar = totalWallArea * FRAME_FACTOR * SHGC * iWin;
         const qGlass = U_GLASS * totalWallArea * (outdoorTemp - currentIndoorTemp);
         solar += qSolar;
-        glass += Math.max(0, qGlass);
+        glass += qGlass;
 
         const glassId = `full_glass_${wDef.id}`;
         hourWindowGains[glassId] = qSolar;
         hourWindowDebug[glassId] = { azimuth: wDef.azimuth, cosTheta, incidentRadiation: iWin, solarGain: qSolar };
 
       } else {
-        // 'opaque' or 'mixed' — process embedded windows, then remaining solid area
         let totalWindowAreaOnWall = 0;
 
         if (wDef.constructionType === 'mixed') {
@@ -213,14 +286,33 @@ export const calculateHeatLoad = (
             const gammaS = sunAzimuthDeg * Math.PI / 180;
             const gammaW = wDef.azimuth * Math.PI / 180;
             const cosTheta = Math.max(0, Math.cos(alpha) * Math.cos(gammaS - gammaW));
-            const diffuseComponent = 0.5 * dhi * (1 + Math.sin(alpha));
             const groundComponent = 0.5 * GROUND_REFLECTANCE * ghi;
-            const iWin = (alpha > 0 ? dni * cosTheta : 0) + diffuseComponent + groundComponent;
+
+            // Obstruction: block direct solar + reduce diffuse via Sky View Factor
+            let obstrAngleDeg = 0;
+            let svf = 1.0;
+            if (win.obstructionHeightM != null && win.obstructionDistanceM != null && win.obstructionDistanceM > 0) {
+              obstrAngleDeg = Math.atan2(win.obstructionHeightM, win.obstructionDistanceM) * 180 / Math.PI;
+              svf = (1 + Math.cos(obstrAngleDeg * Math.PI / 180)) / 2;
+            }
+
+            // If obstruction width given, compute azimuth half-angle; default to full 180° frontal blocking
+            const obstrAzHalf = (win.obstructionWidthM != null && win.obstructionDistanceM != null && win.obstructionDistanceM > 0)
+              ? Math.atan2(win.obstructionWidthM / 2, win.obstructionDistanceM) * 180 / Math.PI
+              : 90; // full frontal coverage if width not given
+
+            const sunFacingWall = Math.abs(sunAzimuthDeg - wDef.azimuth) <= 90 || Math.abs(sunAzimuthDeg - wDef.azimuth) >= 270;
+            const sunInObstrCone = sunFacingWall && Math.abs(((sunAzimuthDeg - wDef.azimuth) + 360) % 360 - 180) <= obstrAzHalf;
+
+            const directBlocked = obstrAngleDeg > 0 && (alpha * 180 / Math.PI) < obstrAngleDeg && sunInObstrCone;
+            const directComponent = (alpha > 0 && !directBlocked) ? dni * cosTheta : 0;
+            const diffuseEffective = 0.5 * dhi * (1 + Math.sin(alpha)) * svf;
+            const iWin = directComponent + diffuseEffective + groundComponent;
 
             const qSolar = win.areaM2 * FRAME_FACTOR * SHGC * iWin;
             const qGlass = U_GLASS * win.areaM2 * (outdoorTemp - currentIndoorTemp);
             solar += qSolar;
-            glass += Math.max(0, qGlass);
+            glass += qGlass;
             totalWindowAreaOnWall += win.areaM2;
 
             const windowId = `win_${win.id}`;
@@ -229,7 +321,6 @@ export const calculateHeatLoad = (
           });
         }
 
-        // Solid wall conduction (opaque area only)
         const wallNetArea = Math.max(0, totalWallArea - totalWindowAreaOnWall);
         const gammaS_wall = sunAzimuthDeg * Math.PI / 180;
         const gammaW_wall = wDef.azimuth * Math.PI / 180;
@@ -239,11 +330,11 @@ export const calculateHeatLoad = (
 
         const tSolair = outdoorTemp + (ALPHA_WALL * iWall / H_OUT);
         const qWall = THERMAL_MASS_FACTOR * U_WALL * wallNetArea * (tSolair - currentIndoorTemp);
-        wall += Math.max(0, qWall);
+        wall += qWall;
       }
     });
 
-    // RTS Implementation
+    // ── RTS — radiant delays in 1-hour steps (= 60 slots at 1-min resolution) ─
     const convectiveSolar = 0.3 * solar;
     const radiantSolar = 0.7 * solar;
     solarHistory.push(radiantSolar);
@@ -254,55 +345,66 @@ export const calculateHeatLoad = (
     let wallDelayed = 0;
     let roofDelayed = 0;
     for (let i = 0; i < RTS.length; i++) {
-      solarDelayed += RTS[i] * (solarHistory[hour - i - 1] || 0);
-      wallDelayed += RTS[i] * (wallHistory[hour - i] || 0);
-      roofDelayed += RTS[i] * (roofHistory[hour - i] || 0);
+      // Each delay step is 60 slots (= 1 hour) to preserve the hourly RTS physics
+      solarDelayed += RTS[i] * (solarHistory[slot - (i + 1) * 60] || 0);
+      wallDelayed  += RTS[i] * (wallHistory[slot - i * 60]          || 0);
+      roofDelayed  += RTS[i] * (roofHistory[slot - i * 60]          || 0);
     }
 
     const currentTotalLoad = solarDelayed + glass + wallDelayed + roofDelayed + inf + internalEquipment + people + other;
 
-    // AC Capacity
+    // ── AC Capacity ──────────────────────────────────────────────────────────
     const degradation = Math.max(0, (outdoorTemp - 35) * 0.015);
     const performanceFactor = 1 - degradation;
-    const isWorkingHours = hour >= 8 && hour <= 20;
+    const isWorkingHours = h0 >= 8 && h0 <= 20;
     const acActive = isWorkingHours || currentTotalLoad > 500;
     const maxAvailableCapacity = acActive ? (totalRatedCapacity * performanceFactor) : 0;
 
-    // Thermal Simulation
-    // If real measured temps are available, use them directly for this hour.
-    // Otherwise fall back to the physics model estimate.
-    let nextTemp: number;
-    if (realIndoorTemps && realIndoorTemps[hour] != null) {
-      nextTemp = realIndoorTemps[hour];
-    } else {
-      let targetTemp = stepSetPoint + 0.2;
-      if (acActive) {
-        const loadStress = maxAvailableCapacity > 0 ? (currentTotalLoad / maxAvailableCapacity) : 1;
-        targetTemp += Math.min(1.8, loadStress * 2.0);
-      } else {
-        targetTemp = currentIndoorTemp + (outdoorTemp - currentIndoorTemp) * 0.15;
-      }
-      nextTemp = (currentIndoorTemp * 0.70) + (targetTemp * 0.30);
-      if (acActive) {
-        if (nextTemp < 22.5) nextTemp = 22.5;
-        if (nextTemp > 25.8) nextTemp = 25.8;
-      } else {
-        if (nextTemp < 21) nextTemp = 21;
-        if (nextTemp > 28) nextTemp = 28;
-      }
-    }
+    // ── AC output (display / verdict) ────────────────────────────────────────
+    // Uses real sensor data only: electrical watts from DB × avgISEER = cooling watts.
+    // If no real data for this hour the AC is considered OFF for reporting → 0.
+    // Uses real sensor data only: electrical watts from DB × avgISEER = cooling watts.
+    // If no real data for this hour the AC is considered OFF for reporting → 0.
+    const acOutputEst = (realAcOutputsWatts && realAcOutputsWatts[h0] != null && realAcOutputsWatts[h0] > 0)
+      ? realAcOutputsWatts[h0] * avgISEER
+      : 0;
 
-    const tempChange = currentIndoorTemp - nextTemp;
-    let acOutputEst: number;
-    if (realAcOutputsWatts && realAcOutputsWatts[hour] != null) {
-      // Real DB data: electrical watts × avgISEER = actual cooling watts delivered
-      acOutputEst = realAcOutputsWatts[hour] * avgISEER;
+    // ── Thermal Simulation (energy balance + thermal mass) ───────────────────
+    // ΔT = Q_net × Δt / C
+    //   Q_net       = heat flowing INTO the room this slot (watts)
+    //                 = total heat gain − AC cooling removed
+    //   Δt          = SLOT_SECONDS (60 s for 1-min slot)
+    //   C           = roomThermalMassJperK (J/K) — concrete construction
+    //
+    // For the AC cooling term we use:
+    //   • Real sensor data (acOutputEst) when available — most accurate.
+    //   • Estimated from capacity when no real data: AC removes up to
+    //     maxAvailableCapacity, limited by how much load exists.
+    //     This avoids runaway heating in the simulated (no-data) path.
+    //
+    // Real DB data arrays are 24-element (hourly); use h0 as index for both
+    // the :00 and :30 slot within that hour.
+    let nextTemp: number;
+    if (realIndoorTemps && realIndoorTemps[h0] != null) {
+      // ── Path A: sensor data available — interpolate between hourly readings ──
+      const t0 = realIndoorTemps[h0];
+      const t1 = realIndoorTemps[Math.min(h0 + 1, 23)] ?? t0;
+      nextTemp = t0 * (1 - frac) + t1 * frac;
     } else {
-      let sensibleWork = currentTotalLoad + (tempChange * thermalMassWatts * 3.0);
-      acOutputEst = sensibleWork > 0 ? sensibleWork * LATENT_HEAT_FACTOR : sensibleWork;
-      if (!acActive) acOutputEst = 0;
-      if (acOutputEst > maxAvailableCapacity) acOutputEst = maxAvailableCapacity;
-      if (acOutputEst < 0) acOutputEst = 0;
+      // ── Path B: no sensor data — physics simulation ───────────────────────
+      // Cooling removed this slot: prefer real AC output, else capacity estimate.
+      const acCoolingThisSlot = acOutputEst > 0
+        ? acOutputEst                                             // real watts × ISEER
+        : (acActive ? Math.min(currentTotalLoad, maxAvailableCapacity) : 0); // estimated
+
+      const qNet   = currentTotalLoad - acCoolingThisSlot;       // net watts into room
+      const deltaT = (qNet * SLOT_SECONDS) / roomThermalMassJperK; // °C change this slot
+      nextTemp = currentIndoorTemp + deltaT;
+
+      // Thermostat guard: AC cannot cool below setpoint−1°C (compressor cycles off)
+      if (acActive && nextTemp < stepSetPoint - 1) nextTemp = stepSetPoint - 1;
+      // Physical bounds: dew point floor ~15°C; extreme heat ceiling ~45°C
+      nextTemp = Math.max(15, Math.min(45, nextTemp));
     }
 
     currentIndoorTemp = nextTemp;
@@ -311,14 +413,14 @@ export const calculateHeatLoad = (
 
     if (currentTotalLoad > peakLoadWatts) {
       peakLoadWatts = currentTotalLoad;
-      peakLoadTime = `${hour}:00`;
+      peakLoadTime = `${h0.toString().padStart(2, '0')}:${(slot % 60).toString().padStart(2, '0')}`;
       peakPerformanceFactor = performanceFactor;
       acOutputAtPeakLoad = acOutputEst;
     }
 
     data.push({
-      time: `${hour}:00`,
-      hour,
+      time: `${h0.toString().padStart(2, '0')}:${(slot % 60).toString().padStart(2, '0')}`,
+      hour: fracHour,
       outdoorTemp,
       solarLoad: solarDelayed,
       glassLoad: glass,
@@ -334,6 +436,7 @@ export const calculateHeatLoad = (
       acOutputWatts: acOutputEst,
       indoorTempRaw: nextTemp,
       setPoint: stepSetPoint,
+      zoneTransfers: slotTransfers,
       solarAltitude: alpha * 180 / Math.PI,
       solarAzimuth: sunAzimuthDeg,
       dni,
@@ -344,19 +447,20 @@ export const calculateHeatLoad = (
     });
   }
 
-  // Verdict: if real AC output data is available, compare actual output at peak load hour
-  // against the peak load. Otherwise fall back to rated capacity × derating factor.
-  const isSufficient = realAcOutputsWatts
-    ? acOutputAtPeakLoad >= peakLoadWatts
-    : (totalRatedCapacity * peakPerformanceFactor) >= peakLoadWatts;
+  // Verdict: real AC output at the peak load slot vs the peak load (real data only).
+  const isSufficient = acOutputAtPeakLoad >= peakLoadWatts;
+
+  // Total daily AC cooling energy: sum of 1-min slot outputs × (1/60) h ÷ 1000 → kWh
+  const totalDailyAcKwh = data.reduce((sum, d) => sum + d.acOutputWatts / 60 / 1000, 0);
 
   return {
     data,
     peakLoadWatts,
     peakLoadTime,
     isSufficient,
-    averageTemp: totalTempSum / 24,
+    averageTemp: totalTempSum / 1440,  // 1440 slots per day
     maxTemp,
     acOutputAtPeakLoad,
+    totalDailyAcKwh,
   };
 };
