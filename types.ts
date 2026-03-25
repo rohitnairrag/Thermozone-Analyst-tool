@@ -171,6 +171,37 @@ export interface SimulationDataPoint {
   _areaM2: number;
 }
 
+// ── Floor Plan Editor types ──────────────────────────────────────────────────
+
+/**
+ * A sensor placed on the interactive floor plan.
+ * Ceiling-type sensors also serve as AC unit position anchors.
+ */
+export interface SensorPlacement {
+  sensorKey: string;           // compound "dbZone::sensorName"
+  sensorName: string;          // display name (matches temperature grid)
+  classifiedType: 'desk' | 'ceiling';
+  role: 'normal' | 'supply_air' | 'excluded';
+  zoneId: string;              // app zone id this sensor belongs to
+  x: number;                   // meters from office-canvas origin
+  y: number;
+  // Ceiling sensors only — AC anchor
+  flowDirection?: number;      // degrees 0–360 (direction AC blows cold air toward)
+  wallId?: string;             // which wall the AC is mounted on
+}
+
+export interface ZoneOffset {
+  zoneId: string;
+  offsetX: number;  // meters from office-canvas origin (SVG left edge)
+  offsetY: number;  // meters from office-canvas origin (SVG top edge)
+}
+
+/** Office-wide floor plan state (all zones + sensor placements). */
+export interface OfficeFloorPlan {
+  zoneOffsets: ZoneOffset[];
+  sensors: SensorPlacement[];
+}
+
 export interface SimulationResult {
   data: SimulationDataPoint[];
   peakLoadWatts: number;

@@ -5,9 +5,11 @@ import { calculateHeatLoad } from './services/physicsEngine';
 import ResultsDashboard from './components/ResultsDashboard';
 import DebugPanel from './components/DebugPanel';
 import HeatFlowDiagram from './components/HeatFlowDiagram';
+import FloorPlanEditor from './components/FloorPlanEditor';
 import {
   SimulationResult, ACUnit, ZoneProfile, WallDef, Direction,
-  LocationData, HourlyWeather, ConstructionType, EmbeddedWindow, InternalLoadItem, SubZoneConfig, SensorLevel
+  LocationData, HourlyWeather, ConstructionType, EmbeddedWindow, InternalLoadItem, SubZoneConfig, SensorLevel,
+  OfficeFloorPlan,
 } from './types';
 import { searchLocation, fetchWeather, fetchWeatherForDate } from './services/weatherService';
 import { fetchLiveRoomTemp, fetchHistoricalTemps, fetchHistoricalAcOutput, fetchAcBreakdown, fetchSubZones, fetchDesignDayTemp, fetchAllLiveSensors, LiveTempData, HistoricalTempData, HistoricalAcOutputData, AcBreakdownData, SubZoneInfo, DesignDayData, AllSensorsData } from './services/liveDataService';
@@ -215,7 +217,7 @@ const DEFAULT_WALL_MODAL: WallModal = {
 };
 
 function App() {
-  const [activeTab, setActiveTab] = useState<'monitor' | 'configure'>('monitor');
+  const [activeTab, setActiveTab] = useState<'monitor' | 'configure' | 'floor-plan'>('monitor');
   const [configSection, setConfigSection] = useState<'zone' | 'ac' | 'internal' | 'sensors'>('zone');
 
   // Ordered factory defaults — one entry per zone.
@@ -287,8 +289,22 @@ function App() {
   // e.g. { "Table_3": [{ zone: "Zone 2", from: "2026-03-14" }] }
   // Persisted to zones_config.json via the server.
   const [sensorZoneOverrides, setSensorZoneOverrides] = useState<Record<string, Array<{ zone: string; from: string }>>>({});
-  // All sensors across all zones — fetched when the Sensors config section is opened
+  // All sensors across all zones — fetched when the Sensors config section OR Floor Plan tab is opened
   const [allLiveSensors, setAllLiveSensors] = useState<AllSensorsData | null>(null);
+
+  // Floor plan placements (sensor positions + zone offsets) — persisted in localStorage
+  const [floorPlan, setFloorPlanState] = useState<OfficeFloorPlan>(() => {
+    try {
+      const saved = localStorage.getItem('thermozone_floorplan');
+      if (saved) return JSON.parse(saved) as OfficeFloorPlan;
+    } catch {}
+    return { zoneOffsets: [], sensors: [] };
+  });
+
+  const setFloorPlan = (fp: OfficeFloorPlan) => {
+    setFloorPlanState(fp);
+    localStorage.setItem('thermozone_floorplan', JSON.stringify(fp));
+  };
 
   // Selected analysis date — defaults to today IST (YYYY-MM-DD)
   const [selectedDate, setSelectedDate] = useState<string>(
@@ -1167,13 +1183,26 @@ function App() {
             <div className="h-6 w-px bg-slate-700 hidden sm:block"></div>
 
             <div className="flex gap-2">
-              {(['monitor', 'configure'] as const).map((tab) => (
+              {([
+                { id: 'monitor',    label: 'Monitor' },
+                { id: 'configure',  label: 'Configure' },
+                { id: 'floor-plan', label: 'Floor Plan' },
+              ] as const).map(({ id, label }) => (
                 <button
-                  key={tab}
-                  onClick={() => setActiveTab(tab)}
-                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-all capitalize ${activeTab === tab ? 'bg-blue-600 text-white shadow-lg shadow-blue-900/50' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}
+                  key={id}
+                  onClick={() => {
+                    setActiveTab(id);
+                    // Auto-fetch all sensors when Floor Plan tab opens
+                    if (id === 'floor-plan' && !allLiveSensors) {
+                      fetchAllLiveSensors().then(data => {
+                        setAllLiveSensors(data);
+                        setSensorZoneOverrides(data.overrides);
+                      }).catch(console.error);
+                    }
+                  }}
+                  className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${activeTab === id ? 'bg-blue-600 text-white shadow-lg shadow-blue-900/50' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}
                 >
-                  {tab}
+                  {label}
                 </button>
               ))}
             </div>
@@ -2086,6 +2115,19 @@ function App() {
                 )}
               </>
             )}
+          </div>
+        )}
+
+        {/* ── FLOOR PLAN TAB ── */}
+        {activeTab === 'floor-plan' && (
+          <div className="animate-fade-in" style={{ height: 'calc(100vh - 200px)', minHeight: 500 }}>
+            <FloorPlanEditor
+              zones={zones}
+              setZones={setZones}
+              allLiveSensors={allLiveSensors}
+              floorPlan={floorPlan}
+              setFloorPlan={setFloorPlan}
+            />
           </div>
         )}
 
