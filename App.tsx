@@ -5,12 +5,11 @@ import { calculateHeatLoad } from './services/physicsEngine';
 import ResultsDashboard from './components/ResultsDashboard';
 import DebugPanel from './components/DebugPanel';
 import HeatFlowDiagram from './components/HeatFlowDiagram';
-import FloorPlanEditor from './components/FloorPlanEditor';
-import HeatPocketMap from './components/HeatPocketMap';
+
+
 import {
   SimulationResult, ACUnit, ZoneProfile, WallDef, Direction,
   LocationData, HourlyWeather, ConstructionType, EmbeddedWindow, InternalLoadItem, SubZoneConfig, SensorLevel,
-  OfficeFloorPlan,
 } from './types';
 import { searchLocation, fetchWeather, fetchWeatherForDate } from './services/weatherService';
 import { fetchLiveRoomTemp, fetchHistoricalTemps, fetchHistoricalAcOutput, fetchAcBreakdown, fetchSubZones, fetchDesignDayTemp, fetchAllLiveSensors, LiveTempData, HistoricalTempData, HistoricalAcOutputData, AcBreakdownData, SubZoneInfo, DesignDayData, AllSensorsData } from './services/liveDataService';
@@ -218,7 +217,7 @@ const DEFAULT_WALL_MODAL: WallModal = {
 };
 
 function App() {
-  const [activeTab, setActiveTab] = useState<'monitor' | 'configure' | 'floor-plan'>('monitor');
+  const [activeTab, setActiveTab] = useState<'monitor' | 'configure'>('monitor');
   const [configSection, setConfigSection] = useState<'zone' | 'ac' | 'internal' | 'sensors'>('zone');
 
   // Ordered factory defaults — one entry per zone.
@@ -290,82 +289,8 @@ function App() {
   // e.g. { "Table_3": [{ zone: "Zone 2", from: "2026-03-14" }] }
   // Persisted to zones_config.json via the server.
   const [sensorZoneOverrides, setSensorZoneOverrides] = useState<Record<string, Array<{ zone: string; from: string }>>>({});
-  // All sensors across all zones — fetched when the Sensors config section OR Floor Plan tab is opened
+  // All sensors across all zones — fetched when the Sensors config section is opened
   const [allLiveSensors, setAllLiveSensors] = useState<AllSensorsData | null>(null);
-
-  // Floor plan placements (sensor positions + zone offsets) — persisted in localStorage
-  const [floorPlan, setFloorPlanState] = useState<OfficeFloorPlan>(() => {
-    try {
-      const saved = localStorage.getItem('thermozone_floorplan');
-      if (saved) return JSON.parse(saved) as OfficeFloorPlan;
-    } catch {}
-    return { zoneOffsets: [], sensors: [] };
-  });
-
-  const setFloorPlan = (fp: OfficeFloorPlan) => {
-    setFloorPlanState(fp);
-    localStorage.setItem('thermozone_floorplan', JSON.stringify(fp));
-  };
-
-  // ── Live desk temps for HeatPocketMap — desk-classified sensors per zone ─
-  const heatPocketLiveTemps = useMemo<Record<string, number>>(() => {
-    if (!allLiveSensors) return {};
-    const out: Record<string, number> = {};
-    for (const zp of zones) {
-      const pos = zp.sensorPositions ?? {};
-      const zoneSensors = allLiveSensors.sensors.filter(s => s.effectiveZone === zp.zone.name);
-      const deskSensors = zoneSensors.filter(s => {
-        const level = pos[s.name];
-        if (level === 'desk') return true;
-        if (level === 'ac_level' || level === 'exclude') return false;
-        return true;
-      });
-      if (deskSensors.length > 0)
-        out[zp.id] = deskSensors.reduce((sum, s) => sum + s.temp, 0) / deskSensors.length;
-      for (const sz of zp.zone.subZones ?? []) {
-        const subSensors = allLiveSensors.sensors.filter(s => s.dbZone === sz.name || s.naturalZone === sz.name);
-        const deskSub = subSensors.filter(s => {
-          const level = pos[s.name];
-          if (level === 'desk') return true;
-          if (level === 'ac_level' || level === 'exclude') return false;
-          return true;
-        });
-        if (deskSub.length > 0)
-          out[sz.name] = deskSub.reduce((sum, s) => sum + s.temp, 0) / deskSub.length;
-      }
-    }
-    return out;
-  }, [allLiveSensors, zones]);
-
-  // ── Live AC status for HeatPocketMap — setpoint + on/off per zone ────────
-  const heatPocketAcStatus = useMemo<Record<string, { setpoint: number | null; acIsOn: boolean }>>(() => {
-    if (!allLiveSensors) return {};
-    const out: Record<string, { setpoint: number | null; acIsOn: boolean }> = {};
-    for (const zp of zones) {
-      const pos = zp.sensorPositions ?? {};
-      const zoneSensors = allLiveSensors.sensors.filter(s => s.effectiveZone === zp.zone.name);
-      const acSensors = zoneSensors.filter(s => pos[s.name] === 'ac_level');
-      const relevant = acSensors.length > 0
-        ? acSensors
-        : zoneSensors.filter(s => pos[s.name] !== 'desk' && pos[s.name] !== 'exclude');
-      if (relevant.length > 0) {
-        out[zp.id] = {
-          setpoint: relevant.find(s => s.setpoint != null)?.setpoint ?? null,
-          acIsOn:   relevant.some(s => s.powerStatus?.toUpperCase() === 'ON'),
-        };
-      }
-      for (const sz of zp.zone.subZones ?? []) {
-        const subSensors = allLiveSensors.sensors.filter(s => s.dbZone === sz.name || s.naturalZone === sz.name);
-        if (subSensors.length > 0) {
-          out[sz.name] = {
-            setpoint: subSensors.find(s => s.setpoint != null)?.setpoint ?? null,
-            acIsOn:   subSensors.some(s => s.powerStatus?.toUpperCase() === 'ON'),
-          };
-        }
-      }
-    }
-    return out;
-  }, [allLiveSensors, zones]);
 
   // Selected analysis date — defaults to today IST (YYYY-MM-DD)
   const [selectedDate, setSelectedDate] = useState<string>(
@@ -1247,20 +1172,10 @@ function App() {
               {([
                 { id: 'monitor',    label: 'Monitor' },
                 { id: 'configure',  label: 'Configure' },
-                { id: 'floor-plan', label: 'Floor Plan' },
               ] as const).map(({ id, label }) => (
                 <button
                   key={id}
-                  onClick={() => {
-                    setActiveTab(id);
-                    // Auto-fetch all sensors when Floor Plan tab opens
-                    if (id === 'floor-plan' && !allLiveSensors) {
-                      fetchAllLiveSensors().then(data => {
-                        setAllLiveSensors(data);
-                        setSensorZoneOverrides(data.overrides);
-                      }).catch(console.error);
-                    }
-                  }}
+                  onClick={() => setActiveTab(id)}
                   className={`px-3 py-2 rounded-lg text-sm font-medium transition-all ${activeTab === id ? 'bg-blue-600 text-white shadow-lg shadow-blue-900/50' : 'text-slate-400 hover:text-white hover:bg-slate-800'}`}
                 >
                   {label}
@@ -2179,20 +2094,6 @@ function App() {
           </div>
         )}
 
-        {/* ── FLOOR PLAN TAB ── */}
-        {activeTab === 'floor-plan' && (
-          <div className="animate-fade-in px-2 py-4">
-            <HeatPocketMap
-              allZoneResults={allZoneResults}
-              actualTemps={{}}
-              liveDeskTemps={heatPocketLiveTemps}
-              liveAcStatus={heatPocketAcStatus}
-              zones={zones}
-              selectedHour={selectedHour}
-              allLiveSensors={allLiveSensors}
-            />
-          </div>
-        )}
 
         </>)}
       </main>

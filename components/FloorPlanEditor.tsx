@@ -19,12 +19,11 @@ import React, {
   useState, useRef, useEffect, useCallback, useMemo,
 } from 'react';
 import {
-  Eye, EyeOff, Plus, Trash2, X, Move, Thermometer,
-  Wind, ArrowRight, Settings,
+  Eye, EyeOff, Plus, Trash2, X, Settings,
 } from 'lucide-react';
 import {
   ZoneProfile, WallDef, Direction, ConstructionType,
-  SensorPlacement, ZoneOffset, OfficeFloorPlan,
+  SensorPlacement, ZoneOffset, OfficeFloorPlan, CustomRoom,
 } from '../types';
 import { AllSensorsData } from '../services/liveDataService';
 import {
@@ -38,6 +37,19 @@ import { renderIDWToCanvas, IDWPoint } from '../utils/idwInterpolation';
 const SCALE = 50;     // SVG pixels per metre
 const MARGIN = 2;     // metres of padding around the layout
 const ZONE_GAP = 3;   // metres between auto-placed zones
+const CUSTOM_FP_W = 770;  // custom floor plan image width (px)
+const CUSTOM_FP_H = 650;  // custom floor plan image height (px)
+
+/** Room outlines extracted from the drawio floor plan (pixel coords matching the SVG). */
+const DEFAULT_ROOMS: CustomRoom[] = [
+  { id: 'room-meeting',   label: 'MEETING ROOM',  x: 40,    y: 40,    w: 130,  h: 270  },
+  { id: 'room-pantry',    label: 'Pantry',         x: 40,    y: 310,   w: 130,  h: 130  },
+  { id: 'room-embedded',  label: 'EMBEDDED TEAM',  x: 42,    y: 440,   w: 128,  h: 70   },
+  { id: 'room-washroom',  label: 'Washroom',       x: 158.75,y: 320,   w: 110,  h: 60   },
+  { id: 'room-reception', label: 'Reception Area', x: 357.5, y: 277.5, w: 230,  h: 95   },
+  { id: 'room-wa2',       label: 'WORKING AREA 2', x: 270,   y: 160,   w: 200,  h: 120  },
+  { id: 'room-wa1',       label: 'WORKING AREA 1', x: 170,   y: 490,   w: 390,  h: 80   },
+];
 
 // ── geometry helpers ────────────────────────────────────────────────────────
 
@@ -322,7 +334,7 @@ export interface FloorPlanEditorProps {
   setZones:      (zones: ZoneProfile[]) => void;
   allLiveSensors: AllSensorsData | null;
   floorPlan:     OfficeFloorPlan;
-  setFloorPlan:  (fp: OfficeFloorPlan) => void;
+  setFloorPlan:  (fp: OfficeFloorPlan | ((prev: OfficeFloorPlan) => OfficeFloorPlan)) => void;
 }
 
 const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
@@ -342,6 +354,21 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   const [sidebarZoneId,  setSidebarZoneId]  = useState<string>(zones[0]?.id ?? '');
   const [config, setConfig] = useState<HotPocketConfig>(DEFAULT_HOT_POCKET_CONFIG);
   const [showConfig, setShowConfig] = useState(false);
+  // Room dimension editing state
+  const [editingRoom, setEditingRoom] = useState<{
+    id: string; edge: 'w' | 'h'; value: number; svgX: number; svgY: number;
+  } | null>(null);
+
+  // Hovered room wall (for highlight + label)
+  const [hoveredRoomWall, setHoveredRoomWall] = useState<{
+    roomId: string; side: 'top' | 'right' | 'bottom' | 'left';
+  } | null>(null);
+
+  // Room drag ref
+  const roomDragRef = useRef<{
+    roomId: string; startSvgX: number; startSvgY: number;
+    startRoomX: number; startRoomY: number;
+  } | null>(null);
 
   // Zone drag state
   const zoneDragRef = useRef<{
@@ -357,6 +384,58 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   const containerRef = useRef<HTMLDivElement>(null);
 
   // ── derived data ──────────────────────────────────────────────────────────
+
+  /** Custom room outlines — seeded from DEFAULT_ROOMS if not yet saved. */
+  const customRooms: CustomRoom[] = useMemo(
+    () => (floorPlan.customRooms && floorPlan.customRooms.length > 0)
+      ? floorPlan.customRooms
+      : DEFAULT_ROOMS,
+    [floorPlan.customRooms],
+  );
+
+  /** Update a room's width or height and persist. */
+  const updateRoomDimension = useCallback((id: string, edge: 'w' | 'h', value: number) => {
+    setFloorPlan(prev => ({
+      ...prev,
+      customRooms: (prev.customRooms ?? DEFAULT_ROOMS).map(r =>
+        r.id === id ? { ...r, [edge]: Math.max(10, value) } : r
+      ),
+    }));
+  }, [setFloorPlan]);
+
+  /** Move a room to a new position. */
+  const moveRoom = useCallback((id: string, x: number, y: number) => {
+    setFloorPlan(prev => ({
+      ...prev,
+      customRooms: (prev.customRooms ?? DEFAULT_ROOMS).map(r =>
+        r.id === id ? { ...r, x: Math.max(0, x), y: Math.max(0, y) } : r
+      ),
+    }));
+  }, [setFloorPlan]);
+
+  /** Add a new blank room at the centre of the canvas. */
+  const addRoom = useCallback(() => {
+    const newRoom: CustomRoom = {
+      id:    `room-${Date.now()}`,
+      label: 'New Room',
+      x:     CUSTOM_FP_W / 2 - 75,
+      y:     CUSTOM_FP_H / 2 - 50,
+      w:     150,
+      h:     100,
+    };
+    setFloorPlan(prev => ({
+      ...prev,
+      customRooms: [...(prev.customRooms ?? DEFAULT_ROOMS), newRoom],
+    }));
+  }, [setFloorPlan]);
+
+  /** Delete a room by id. */
+  const deleteRoom = useCallback((id: string) => {
+    setFloorPlan(prev => ({
+      ...prev,
+      customRooms: (prev.customRooms ?? DEFAULT_ROOMS).filter(r => r.id !== id),
+    }));
+  }, [setFloorPlan]);
 
   /** Effective zone offsets: merge saved with defaults for any new zones. */
   const zoneOffsets = useMemo(
@@ -382,17 +461,11 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     };
   };
 
-  /** SVG viewport size (based on all zone polygons). */
-  const svgSize = useMemo(() => {
-    let maxX = 0, maxY = 0;
-    for (const z of zones) {
-      const bb  = zoneBBox(z.zone.walls);
-      const off = getOffset(z.id);
-      maxX = Math.max(maxX, off.offsetX + bb.maxX + MARGIN);
-      maxY = Math.max(maxY, off.offsetY + bb.maxY + MARGIN);
-    }
-    return { width: maxX * SCALE, height: maxY * SCALE };
-  }, [zones, zoneOffsets]);
+  /** SVG viewport size — always uses the custom floor plan dimensions. */
+  const svgSize = useMemo(
+    () => ({ width: CUSTOM_FP_W, height: CUSTOM_FP_H }),
+    [],
+  );
 
   /** Build sensor list from allLiveSensors for the currently selected sidebar zone. */
   const sidebarZone = useMemo(() => zones.find(z => z.id === sidebarZoneId), [zones, sidebarZoneId]);
@@ -501,11 +574,11 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   }, [floorPlan, zoneOffsets, setFloorPlan]);
 
   const placeSensor = useCallback((sp: SensorPlacement) => {
-    setFloorPlan({
-      ...floorPlan,
-      sensors: [...floorPlan.sensors.filter(s => s.sensorKey !== sp.sensorKey), sp],
-    });
-  }, [floorPlan, setFloorPlan]);
+    setFloorPlan(prev => ({
+      ...prev,
+      sensors: [...prev.sensors.filter(s => s.sensorKey !== sp.sensorKey), sp],
+    }));
+  }, [setFloorPlan]);  // no floorPlan dependency → never stale
 
   const removePlacedSensor = useCallback((key: string) => {
     setFloorPlan({ ...floorPlan, sensors: floorPlan.sensors.filter(s => s.sensorKey !== key) });
@@ -622,21 +695,19 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
     const svgX = e.clientX - rect.left;
     const svgY = e.clientY - rect.top;
 
-    // Find which zone this point falls in (closest zone offset anchor)
-    // Simple: the zone whose centroid SVG position is nearest to the drop
-    const zoneId = drag.zoneId;
-    const off    = getOffset(zoneId);
-    const xM     = svgX / SCALE - off.offsetX;
-    const yM     = svgY / SCALE - off.offsetY;
+    // Always use raw pixel / SCALE — no zone offset in custom floor plan mode
+    const xM = svgX / SCALE;
+    const yM = svgY / SCALE;
 
     const newPlacement: SensorPlacement = {
       sensorKey:      drag.key,
       sensorName:     drag.name,
       classifiedType: drag.classifiedType,
       role:           'normal',
-      zoneId,
+      zoneId:         drag.zoneId,
       x: parseFloat(xM.toFixed(2)),
       y: parseFloat(yM.toFixed(2)),
+      isCustomMode:   true,
     };
 
     placeSensor(newPlacement);
@@ -657,12 +728,27 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   };
 
   const handleSvgMouseMoveForSensor = (e: React.MouseEvent<SVGSVGElement>) => {
+    // Room drag
+    if (roomDragRef.current) {
+      const { roomId, startSvgX, startSvgY, startRoomX, startRoomY } = roomDragRef.current;
+      const cur = svgCoordsFromEvent(e);
+      moveRoom(roomId, startRoomX + (cur.x - startSvgX), startRoomY + (cur.y - startSvgY));
+      return;
+    }
+    // Placed sensor drag
     if (placedSensorDragRef.current) {
       const { key, zoneId } = placedSensorDragRef.current;
       const cur = svgCoordsFromEvent(e);
-      const off = getOffset(zoneId);
-      const xM  = parseFloat((cur.x / SCALE - off.offsetX).toFixed(2));
-      const yM  = parseFloat((cur.y / SCALE - off.offsetY).toFixed(2));
+      const sensor = floorPlan.sensors.find(s => s.sensorKey === key);
+      let xM: number, yM: number;
+      if (sensor?.isCustomMode) {
+        xM = parseFloat((cur.x / SCALE).toFixed(2));
+        yM = parseFloat((cur.y / SCALE).toFixed(2));
+      } else {
+        const off = getOffset(zoneId);
+        xM = parseFloat((cur.x / SCALE - off.offsetX).toFixed(2));
+        yM = parseFloat((cur.y / SCALE - off.offsetY).toFixed(2));
+      }
       updateSensorPosition(key, xM, yM);
     }
     handleSvgMouseMove(e);
@@ -670,6 +756,7 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
 
   const handleSvgMouseUpAll = () => {
     placedSensorDragRef.current = null;
+    roomDragRef.current = null;
     handleSvgMouseUp();
   };
 
@@ -679,15 +766,21 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
   const selectedScore  = selectedSensorKey ? hotPocketMap.get(selectedSensorKey) : null;
   const selectedLiveData = allLiveSensors?.sensors.find(s => s.key === selectedSensorKey);
 
-  // Nearest AC (ceiling sensor) distance
-  const nearestAcDistance = useMemo(() => {
+  // Nearest AC distances — separate X and Y components (in metres)
+  const acDistances = useMemo(() => {
     if (!selectedSensor) return null;
     const acs = floorPlan.sensors.filter(
-      s => s.classifiedType === 'ceiling' && s.zoneId === selectedSensor.zoneId && s.role !== 'excluded',
+      s => s.classifiedType === 'ceiling' && s.role !== 'excluded',
     );
     if (acs.length === 0) return null;
-    const dists = acs.map(a => Math.sqrt((a.x - selectedSensor.x) ** 2 + (a.y - selectedSensor.y) ** 2));
-    return Math.min(...dists).toFixed(1);
+    let best: { dx: number; dy: number; dist: number; acName: string } | null = null;
+    for (const ac of acs) {
+      const dx = Math.abs(selectedSensor.x - ac.x);
+      const dy = Math.abs(selectedSensor.y - ac.y);
+      const dist = Math.sqrt(dx * dx + dy * dy);
+      if (!best || dist < best.dist) best = { dx, dy, dist, acName: ac.sensorName };
+    }
+    return best;
   }, [selectedSensor, floorPlan.sensors]);
 
   // ── render ────────────────────────────────────────────────────────────────
@@ -702,23 +795,13 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         <span className="text-white font-semibold text-sm">Floor Plan Editor</span>
         <div className="h-4 w-px bg-slate-700" />
 
-        {/* Zone selector for "Add Wall" */}
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-slate-400">Zone:</span>
-          <select
-            value={addWallZoneId ?? zones[0]?.id ?? ''}
-            onChange={e => setAddWallZoneId(e.target.value)}
-            className="bg-slate-800 border border-slate-700 text-white text-xs rounded-lg px-2 py-1 outline-none"
-          >
-            {zones.map(z => <option key={z.id} value={z.id}>{z.zone.displayName || z.zone.name}</option>)}
-          </select>
-          <button
-            onClick={() => setShowAddWall(true)}
-            className="flex items-center gap-1 bg-slate-700 hover:bg-slate-600 text-white text-xs rounded-lg px-2 py-1"
-          >
-            <Plus size={12} /> Add Wall
-          </button>
-        </div>
+        <button
+          onClick={addRoom}
+          className="flex items-center gap-1 bg-slate-700 hover:bg-slate-600 text-white text-xs rounded-lg px-2 py-1.5"
+          title="Add a new room to the floor plan"
+        >
+          <Plus size={12} /> Add Room
+        </button>
 
         <div className="h-4 w-px bg-slate-700" />
 
@@ -834,105 +917,101 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
               onMouseLeave={handleSvgMouseUpAll}
               onDragOver={handleCanvasDragOver}
               onDrop={handleCanvasDrop}
-              onClick={() => { setSelectedWall(null); setSelectedSensorKey(null); }}
+              onClick={() => { setSelectedWall(null); setSelectedSensorKey(null); setEditingRoom(null); }}
             >
-              {/* Grid */}
-              <defs>
-                <pattern id="grid1m" width={SCALE} height={SCALE} patternUnits="userSpaceOnUse">
-                  <path d={`M ${SCALE} 0 L 0 0 0 ${SCALE}`} fill="none" stroke="#1e293b" strokeWidth="0.5" />
-                </pattern>
-              </defs>
-              <rect width={svgSize.width} height={svgSize.height} fill="url(#grid1m)" />
+              {/* Floor plan background image */}
+              <image
+                href="/floor_plan.svg"
+                x={0} y={0}
+                width={CUSTOM_FP_W}
+                height={CUSTOM_FP_H}
+                preserveAspectRatio="xMidYMid meet"
+                style={{ pointerEvents: 'none' }}
+              />
 
-              {/* Zone polygons + walls */}
-              {zones.map(z => {
-                const off   = getOffset(z.id);
-                const pts   = wallsToPolyMetres(z.zone.walls);
-                const svgPts = pts.map(p => ({
-                  x: (off.offsetX + p.x) * SCALE,
-                  y: (off.offsetY + p.y) * SCALE,
-                }));
-                const polyStr = svgPts.map(p => `${p.x},${p.y}`).join(' ');
-                const cen    = zoneCentroid(z.zone.walls);
-                const cenSVG = toSVG(z.id, cen);
+              {/* Editable room outlines — transparent walls overlaid on the SVG */}
+              {customRooms.map(room => {
+                const cx = room.x + room.w / 2;
+                const cy = room.y + room.h / 2;
+
+                type Side = 'top' | 'right' | 'bottom' | 'left';
+                const sides: Array<{
+                  side: Side; x1: number; y1: number; x2: number; y2: number;
+                  edge: 'w' | 'h'; midX: number; midY: number;
+                  labelX: number; labelY: number; anchor: string; cursor: string;
+                }> = [
+                  { side: 'top',    x1: room.x,        y1: room.y,        x2: room.x+room.w, y2: room.y,        edge: 'w', midX: cx,            midY: room.y,        labelX: cx,            labelY: room.y-8,        anchor: 'middle', cursor: 'ns-resize' },
+                  { side: 'bottom', x1: room.x,        y1: room.y+room.h, x2: room.x+room.w, y2: room.y+room.h, edge: 'w', midX: cx,            midY: room.y+room.h, labelX: cx,            labelY: room.y+room.h+12, anchor: 'middle', cursor: 'ns-resize' },
+                  { side: 'left',   x1: room.x,        y1: room.y,        x2: room.x,        y2: room.y+room.h, edge: 'h', midX: room.x,        midY: cy,            labelX: room.x-6,      labelY: cy,              anchor: 'end',    cursor: 'ew-resize' },
+                  { side: 'right',  x1: room.x+room.w, y1: room.y,        x2: room.x+room.w, y2: room.y+room.h, edge: 'h', midX: room.x+room.w, midY: cy,            labelX: room.x+room.w+6, labelY: cy,            anchor: 'start',  cursor: 'ew-resize' },
+                ];
 
                 return (
-                  <g key={z.id}>
-                    {/* Zone fill */}
-                    <polygon
-                      points={polyStr}
-                      fill="#1e293b"
-                      stroke="#334155"
-                      strokeWidth="1.5"
-                    />
+                  <g key={room.id}>
+                    {/* Room label — drag to move the room */}
+                    <text
+                      x={cx} y={cy}
+                      textAnchor="middle" dominantBaseline="middle"
+                      fill="#94a3b8" fontSize={10} fontWeight="500"
+                      style={{ cursor: 'move', userSelect: 'none' }}
+                      onMouseDown={e => {
+                        e.stopPropagation();
+                        const cur = svgCoordsFromEvent(e as any);
+                        roomDragRef.current = {
+                          roomId: room.id, startSvgX: cur.x, startSvgY: cur.y,
+                          startRoomX: room.x, startRoomY: room.y,
+                        };
+                      }}
+                    >
+                      {room.label}
+                    </text>
 
-                    {/* Wall segments (clickable) */}
-                    {z.zone.walls.map((wall, idx) => {
-                      const a   = svgPts[idx];
-                      const b   = svgPts[idx + 1] ?? svgPts[0];
-                      const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 };
-                      const isHovered  = hoveredWall?.zoneId === z.id && hoveredWall?.wallIdx === idx;
-                      const isSelected = selectedWall?.zoneId === z.id && selectedWall?.wallIdx === idx;
-                      const strokeColor = isSelected ? '#3b82f6'
-                                        : isHovered  ? '#60a5fa'
-                                        : wall.wallType === 'external' ? '#475569' : '#334155';
+                    {/* Wall sides — each is independently hoverable and clickable */}
+                    {sides.map(s => {
+                      const isHov = hoveredRoomWall?.roomId === room.id && hoveredRoomWall?.side === s.side;
+                      const lenM  = (s.edge === 'w' ? room.w : room.h) / SCALE;
                       return (
-                        <g key={wall.id}>
-                          {/* Invisible hit target */}
+                        <g key={s.side}>
+                          {/* Invisible wide hit target */}
                           <line
-                            x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-                            stroke="transparent" strokeWidth={14}
-                            style={{ cursor: 'pointer' }}
-                            onMouseEnter={() => setHoveredWall({ zoneId: z.id, wallIdx: idx })}
-                            onMouseLeave={() => setHoveredWall(null)}
-                            onClick={e => handleWallClick(e, z.id, idx, mid.x, mid.y)}
+                            x1={s.x1} y1={s.y1} x2={s.x2} y2={s.y2}
+                            stroke="transparent" strokeWidth={12}
+                            style={{ cursor: s.cursor }}
+                            onMouseEnter={() => setHoveredRoomWall({ roomId: room.id, side: s.side })}
+                            onMouseLeave={() => setHoveredRoomWall(null)}
+                            onClick={e => {
+                              e.stopPropagation();
+                              setEditingRoom({ id: room.id, edge: s.edge, value: s.edge === 'w' ? room.w : room.h, svgX: s.midX, svgY: s.midY });
+                            }}
                           />
                           {/* Visible wall line */}
                           <line
-                            x1={a.x} y1={a.y} x2={b.x} y2={b.y}
-                            stroke={strokeColor}
-                            strokeWidth={isHovered || isSelected ? 3 : 2}
-                            strokeDasharray={wall.wallType === 'internal' ? '6,4' : undefined}
+                            x1={s.x1} y1={s.y1} x2={s.x2} y2={s.y2}
+                            stroke={isHov ? '#3b82f6' : '#64748b'}
+                            strokeWidth={isHov ? 3 : 1.5}
                             style={{ pointerEvents: 'none' }}
                           />
-                          {/* Length label */}
-                          {(isHovered || isSelected) && (
+                          {/* Dimension label — shown on hover */}
+                          {isHov && (
                             <text
-                              x={mid.x} y={mid.y - 6}
-                              textAnchor="middle"
-                              fill="#94a3b8"
-                              fontSize={10}
-                              style={{ pointerEvents: 'none' }}
+                              x={s.labelX} y={s.labelY}
+                              textAnchor={s.anchor} dominantBaseline="middle"
+                              fill="#93c5fd" fontSize={9} fontWeight="600"
+                              style={{ pointerEvents: 'none', userSelect: 'none' }}
                             >
-                              {wall.lengthM.toFixed(1)} m
+                              {lenM.toFixed(2)} m
                             </text>
                           )}
                         </g>
                       );
                     })}
-
-                    {/* Zone drag handle (centroid label) */}
-                    <g
-                      style={{ cursor: 'move' }}
-                      onMouseDown={e => startZoneDrag(e, z.id)}
-                    >
-                      <circle cx={cenSVG.x} cy={cenSVG.y} r={14} fill="#0f172a" stroke="#334155" />
-                      <text x={cenSVG.x} y={cenSVG.y - 2} textAnchor="middle"
-                        fill="#94a3b8" fontSize={8} style={{ pointerEvents: 'none' }}>
-                        ⠿
-                      </text>
-                      <text x={cenSVG.x} y={cenSVG.y + 9} textAnchor="middle"
-                        fill="#64748b" fontSize={8} style={{ pointerEvents: 'none' }}>
-                        {z.zone.displayName || z.zone.name}
-                      </text>
-                    </g>
                   </g>
                 );
               })}
 
               {/* Placed sensors */}
               {floorPlan.sensors.map(sp => {
-                const off    = getOffset(sp.zoneId);
+                const off    = sp.isCustomMode ? { offsetX: 0, offsetY: 0 } : getOffset(sp.zoneId);
                 const svgX   = (off.offsetX + sp.x) * SCALE;
                 const svgY   = (off.offsetY + sp.y) * SCALE;
                 const score  = hotPocketMap.get(sp.sensorKey);
@@ -1061,10 +1140,13 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
                   />
                 </label>
               </div>
-              {nearestAcDistance && (
-                <p className="text-xs text-slate-500">
-                  Nearest AC: <span className="text-slate-300">{nearestAcDistance} m</span>
-                </p>
+              {acDistances && (
+                <div className="text-xs text-slate-500 space-y-0.5">
+                  <p className="text-slate-400 font-medium">Distance from {acDistances.acName}:</p>
+                  <p>X: <span className="text-cyan-300">{acDistances.dx.toFixed(1)} m</span>
+                  {'  '}Y: <span className="text-cyan-300">{acDistances.dy.toFixed(1)} m</span></p>
+                  <p>Total: <span className="text-slate-300">{acDistances.dist.toFixed(1)} m</span></p>
+                </div>
               )}
             </div>
 
@@ -1150,21 +1232,15 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
         />
       )}
 
-      {showAddWall && (
-        <AddWallDialog onAdd={addWall} onClose={() => setShowAddWall(false)} />
-      )}
-
-      {selectedWall && (
-        <WallEditPopover
-          wallLength={
-            zones.find(z => z.id === selectedWall.zoneId)
-              ?.zone.walls[selectedWall.wallIdx]?.lengthM ?? 0
-          }
-          svgX={selectedWall.svgX}
-          svgY={selectedWall.svgY}
-          onSave={len => updateWallLength(selectedWall.zoneId, selectedWall.wallIdx, len)}
-          onDelete={() => deleteWall(selectedWall.zoneId, selectedWall.wallIdx)}
-          onClose={() => setSelectedWall(null)}
+      {editingRoom && (
+        <RoomDimPopover
+          label={editingRoom.edge === 'w' ? 'Wall Width' : 'Wall Height'}
+          valuePx={editingRoom.value}
+          svgX={editingRoom.svgX}
+          svgY={editingRoom.svgY}
+          onSave={px => { updateRoomDimension(editingRoom.id, editingRoom.edge, px); setEditingRoom(null); }}
+          onClose={() => setEditingRoom(null)}
+          onDelete={() => { deleteRoom(editingRoom.id); setEditingRoom(null); }}
         />
       )}
     </div>
@@ -1172,6 +1248,68 @@ const FloorPlanEditor: React.FC<FloorPlanEditorProps> = ({
 };
 
 // ── helper sub-components ──────────────────────────────────────────────────
+
+/** Popover for editing a room wall dimension in metres. */
+function RoomDimPopover({
+  label,
+  valuePx,
+  svgX,
+  svgY,
+  onSave,
+  onClose,
+  onDelete,
+}: {
+  label: string;
+  valuePx: number;
+  svgX: number;
+  svgY: number;
+  onSave: (px: number) => void;
+  onClose: () => void;
+  onDelete?: () => void;
+}) {
+  const [val, setVal] = useState((valuePx / SCALE).toFixed(2));
+  return (
+    <div
+      style={{ position: 'absolute', left: svgX + 8, top: Math.max(0, svgY - 60), zIndex: 50 }}
+      className="bg-slate-800 border border-slate-600 rounded-xl shadow-xl p-3 flex flex-col gap-2 w-52"
+    >
+      <div className="flex items-center justify-between">
+        <span className="text-xs text-slate-400 font-semibold uppercase">{label}</span>
+        <button onClick={onClose} className="text-slate-500 hover:text-white"><X size={12} /></button>
+      </div>
+      <div className="flex items-center gap-1">
+        <input
+          type="number"
+          value={val}
+          step="0.1"
+          min="0.2"
+          onChange={e => setVal(e.target.value)}
+          className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2 py-1 text-white text-sm outline-none focus:border-blue-500"
+          autoFocus
+          onKeyDown={e => { if (e.key === 'Enter') onSave((parseFloat(val) || 1) * SCALE); }}
+        />
+        <span className="text-slate-400 text-xs">m</span>
+      </div>
+      <div className="flex gap-2">
+        <button
+          onClick={() => onSave((parseFloat(val) || 1) * SCALE)}
+          className="flex-1 bg-blue-600 hover:bg-blue-500 text-white text-xs rounded-lg py-1 font-medium"
+        >
+          Save
+        </button>
+        {onDelete && (
+          <button
+            onClick={onDelete}
+            className="px-2 py-1 text-red-400 hover:text-red-300 hover:bg-red-900/30 rounded-lg"
+            title="Delete this room"
+          >
+            <Trash2 size={12} />
+          </button>
+        )}
+      </div>
+    </div>
+  );
+}
 
 function SensorGroup({
   label, color, sensors, classifiedType, zoneId, placedMap, dragSensorRef, hotPocketMap,
@@ -1203,7 +1341,7 @@ function SensorGroup({
             onDragStart={() => {
               dragSensorRef.current = { key: s.key, name: s.name, classifiedType, zoneId };
             }}
-            onDragEnd={() => { /* ref cleared in drop handler */ }}
+            onDragEnd={() => { dragSensorRef.current = null; }}
             className={`flex items-center justify-between px-3 py-2 cursor-grab hover:bg-slate-800/60 transition-colors ${
               isPlaced ? 'opacity-50' : ''
             }`}
