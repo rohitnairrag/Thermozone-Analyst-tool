@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Activity, Thermometer, Wind, Server, Plus, Trash2, Map, Clock, LayoutGrid, Bug, Pencil, X, Flame, RotateCcw } from 'lucide-react';
 import { DEFAULT_ACS, DEFAULT_ZONE } from './constants';
 import { calculateHeatLoad } from './services/physicsEngine';
@@ -6,6 +6,7 @@ import ResultsDashboard from './components/ResultsDashboard';
 import DebugPanel from './components/DebugPanel';
 import HeatFlowDiagram from './components/HeatFlowDiagram';
 import FloorPlanEditor from './components/FloorPlanEditor';
+
 import {
   SimulationResult, ACUnit, ZoneProfile, WallDef, Direction,
   LocationData, HourlyWeather, ConstructionType, EmbeddedWindow, InternalLoadItem, SubZoneConfig, SensorLevel,
@@ -289,10 +290,20 @@ function App() {
   // e.g. { "Table_3": [{ zone: "Zone 2", from: "2026-03-14" }] }
   // Persisted to zones_config.json via the server.
   const [sensorZoneOverrides, setSensorZoneOverrides] = useState<Record<string, Array<{ zone: string; from: string }>>>({});
-  // All sensors across all zones — fetched when the Sensors config section OR Floor Plan tab is opened
+  // All sensors across all zones — fetched when the Sensors config section or Floor Plan tab opens
   const [allLiveSensors, setAllLiveSensors] = useState<AllSensorsData | null>(null);
 
-  // Floor plan placements (sensor positions + zone offsets) — persisted in localStorage
+  // Uploaded floor plan SVG — stored as encoded data URL in localStorage
+  const [floorPlanSvg, setFloorPlanSvgState] = useState<string | null>(() =>
+    localStorage.getItem('thermozone_floorplan_svg')
+  );
+  const setFloorPlanSvg = (url: string | null) => {
+    if (url) localStorage.setItem('thermozone_floorplan_svg', url);
+    else localStorage.removeItem('thermozone_floorplan_svg');
+    setFloorPlanSvgState(url);
+  };
+
+  // Sensor placements on the floor plan — persisted in localStorage
   const [floorPlan, setFloorPlanState] = useState<OfficeFloorPlan>(() => {
     try {
       const saved = localStorage.getItem('thermozone_floorplan');
@@ -300,10 +311,12 @@ function App() {
     } catch {}
     return { zoneOffsets: [], sensors: [] };
   });
-
-  const setFloorPlan = (fp: OfficeFloorPlan) => {
-    setFloorPlanState(fp);
-    localStorage.setItem('thermozone_floorplan', JSON.stringify(fp));
+  const setFloorPlan = (fpOrUpdater: OfficeFloorPlan | ((prev: OfficeFloorPlan) => OfficeFloorPlan)) => {
+    setFloorPlanState(prev => {
+      const next = typeof fpOrUpdater === 'function' ? fpOrUpdater(prev) : fpOrUpdater;
+      localStorage.setItem('thermozone_floorplan', JSON.stringify(next));
+      return next;
+    });
   };
 
   // Selected analysis date — defaults to today IST (YYYY-MM-DD)
@@ -1192,11 +1205,9 @@ function App() {
                   key={id}
                   onClick={() => {
                     setActiveTab(id);
-                    // Auto-fetch all sensors when Floor Plan tab opens
                     if (id === 'floor-plan' && !allLiveSensors) {
                       fetchAllLiveSensors().then(data => {
-                        setAllLiveSensors(data);
-                        setSensorZoneOverrides(data.overrides);
+                        if (data) { setAllLiveSensors(data); setSensorZoneOverrides(data.overrides); }
                       }).catch(console.error);
                     }
                   }}
@@ -2118,15 +2129,18 @@ function App() {
           </div>
         )}
 
+
         {/* ── FLOOR PLAN TAB ── */}
         {activeTab === 'floor-plan' && (
-          <div className="animate-fade-in" style={{ height: 'calc(100vh - 200px)', minHeight: 500 }}>
+          <div className="animate-fade-in" style={{ height: 'calc(100vh - 120px)' }}>
             <FloorPlanEditor
               zones={zones}
               setZones={setZones}
               allLiveSensors={allLiveSensors}
               floorPlan={floorPlan}
               setFloorPlan={setFloorPlan}
+              floorPlanSvg={floorPlanSvg}
+              setFloorPlanSvg={setFloorPlanSvg}
             />
           </div>
         )}

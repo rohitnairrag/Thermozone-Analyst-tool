@@ -188,6 +188,7 @@ export interface SensorPlacement {
   // Ceiling sensors only — AC anchor
   flowDirection?: number;      // degrees 0–360 (direction AC blows cold air toward)
   wallId?: string;             // which wall the AC is mounted on
+  isCustomMode?: boolean;      // true = x/y are raw SVG px / SCALE (no zone offset)
 }
 
 export interface ZoneOffset {
@@ -196,10 +197,21 @@ export interface ZoneOffset {
   offsetY: number;  // meters from office-canvas origin (SVG top edge)
 }
 
+/** A room outline on the custom floor plan, editable by the user. */
+export interface CustomRoom {
+  id: string;
+  label: string;
+  x: number;   // SVG pixels from canvas origin
+  y: number;
+  w: number;
+  h: number;
+}
+
 /** Office-wide floor plan state (all zones + sensor placements). */
 export interface OfficeFloorPlan {
   zoneOffsets: ZoneOffset[];
   sensors: SensorPlacement[];
+  customRooms?: CustomRoom[];  // editable room outlines drawn from drawio
 }
 
 export interface SimulationResult {
