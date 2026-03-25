@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { Activity, Thermometer, Wind, Server, Plus, Trash2, Map, Clock, LayoutGrid, Bug, Pencil, X, Flame, RotateCcw } from 'lucide-react';
 import { DEFAULT_ACS, DEFAULT_ZONE } from './constants';
 import { calculateHeatLoad } from './services/physicsEngine';
@@ -6,6 +6,7 @@ import ResultsDashboard from './components/ResultsDashboard';
 import DebugPanel from './components/DebugPanel';
 import HeatFlowDiagram from './components/HeatFlowDiagram';
 import FloorPlanEditor from './components/FloorPlanEditor';
+import HeatPocketMap from './components/HeatPocketMap';
 import {
   SimulationResult, ACUnit, ZoneProfile, WallDef, Direction,
   LocationData, HourlyWeather, ConstructionType, EmbeddedWindow, InternalLoadItem, SubZoneConfig, SensorLevel,
@@ -305,6 +306,66 @@ function App() {
     setFloorPlanState(fp);
     localStorage.setItem('thermozone_floorplan', JSON.stringify(fp));
   };
+
+  // ── Live desk temps for HeatPocketMap — desk-classified sensors per zone ─
+  const heatPocketLiveTemps = useMemo<Record<string, number>>(() => {
+    if (!allLiveSensors) return {};
+    const out: Record<string, number> = {};
+    for (const zp of zones) {
+      const pos = zp.sensorPositions ?? {};
+      const zoneSensors = allLiveSensors.sensors.filter(s => s.effectiveZone === zp.zone.name);
+      const deskSensors = zoneSensors.filter(s => {
+        const level = pos[s.name];
+        if (level === 'desk') return true;
+        if (level === 'ac_level' || level === 'exclude') return false;
+        return true;
+      });
+      if (deskSensors.length > 0)
+        out[zp.id] = deskSensors.reduce((sum, s) => sum + s.temp, 0) / deskSensors.length;
+      for (const sz of zp.zone.subZones ?? []) {
+        const subSensors = allLiveSensors.sensors.filter(s => s.dbZone === sz.name || s.naturalZone === sz.name);
+        const deskSub = subSensors.filter(s => {
+          const level = pos[s.name];
+          if (level === 'desk') return true;
+          if (level === 'ac_level' || level === 'exclude') return false;
+          return true;
+        });
+        if (deskSub.length > 0)
+          out[sz.name] = deskSub.reduce((sum, s) => sum + s.temp, 0) / deskSub.length;
+      }
+    }
+    return out;
+  }, [allLiveSensors, zones]);
+
+  // ── Live AC status for HeatPocketMap — setpoint + on/off per zone ────────
+  const heatPocketAcStatus = useMemo<Record<string, { setpoint: number | null; acIsOn: boolean }>>(() => {
+    if (!allLiveSensors) return {};
+    const out: Record<string, { setpoint: number | null; acIsOn: boolean }> = {};
+    for (const zp of zones) {
+      const pos = zp.sensorPositions ?? {};
+      const zoneSensors = allLiveSensors.sensors.filter(s => s.effectiveZone === zp.zone.name);
+      const acSensors = zoneSensors.filter(s => pos[s.name] === 'ac_level');
+      const relevant = acSensors.length > 0
+        ? acSensors
+        : zoneSensors.filter(s => pos[s.name] !== 'desk' && pos[s.name] !== 'exclude');
+      if (relevant.length > 0) {
+        out[zp.id] = {
+          setpoint: relevant.find(s => s.setpoint != null)?.setpoint ?? null,
+          acIsOn:   relevant.some(s => s.powerStatus?.toUpperCase() === 'ON'),
+        };
+      }
+      for (const sz of zp.zone.subZones ?? []) {
+        const subSensors = allLiveSensors.sensors.filter(s => s.dbZone === sz.name || s.naturalZone === sz.name);
+        if (subSensors.length > 0) {
+          out[sz.name] = {
+            setpoint: subSensors.find(s => s.setpoint != null)?.setpoint ?? null,
+            acIsOn:   subSensors.some(s => s.powerStatus?.toUpperCase() === 'ON'),
+          };
+        }
+      }
+    }
+    return out;
+  }, [allLiveSensors, zones]);
 
   // Selected analysis date — defaults to today IST (YYYY-MM-DD)
   const [selectedDate, setSelectedDate] = useState<string>(
@@ -2120,13 +2181,15 @@ function App() {
 
         {/* ── FLOOR PLAN TAB ── */}
         {activeTab === 'floor-plan' && (
-          <div className="animate-fade-in" style={{ height: 'calc(100vh - 200px)', minHeight: 500 }}>
-            <FloorPlanEditor
+          <div className="animate-fade-in px-2 py-4">
+            <HeatPocketMap
+              allZoneResults={allZoneResults}
+              actualTemps={{}}
+              liveDeskTemps={heatPocketLiveTemps}
+              liveAcStatus={heatPocketAcStatus}
               zones={zones}
-              setZones={setZones}
+              selectedHour={selectedHour}
               allLiveSensors={allLiveSensors}
-              floorPlan={floorPlan}
-              setFloorPlan={setFloorPlan}
             />
           </div>
         )}
