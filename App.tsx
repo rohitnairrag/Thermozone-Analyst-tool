@@ -10,7 +10,7 @@ import {
   LocationData, HourlyWeather, ConstructionType, EmbeddedWindow, InternalLoadItem, SubZoneConfig, SensorLevel
 } from './types';
 import { searchLocation, fetchWeather, fetchWeatherForDate } from './services/weatherService';
-import { fetchLiveRoomTemp, fetchHistoricalTemps, fetchHistoricalAcOutput, fetchAcBreakdown, fetchSubZones, fetchDesignDayTemp, fetchAllLiveSensors, LiveTempData, HistoricalTempData, HistoricalAcOutputData, AcBreakdownData, SubZoneInfo, DesignDayData, AllSensorsData } from './services/liveDataService';
+import { fetchLiveRoomTemp, fetchHistoricalTemps, fetchHistoricalAcOutput, fetchAcBreakdown, fetchSubZones, fetchDesignDayTemp, fetchAllLiveSensors, fetchCameraOccupancy, LiveTempData, HistoricalTempData, HistoricalAcOutputData, AcBreakdownData, SubZoneInfo, DesignDayData, AllSensorsData, CameraOccupancyData } from './services/liveDataService';
 import { computeFloorArea } from './services/geometry';
 
 const AZIMUTH_MAP: Record<string, number> = {
@@ -54,6 +54,17 @@ const ZONE_DISPLAY_NAMES: Record<string, string> = {
   'Zone 4': 'Corridor & Reception',
 };
 
+// Maps old schedulePreset values to equivalent startTime/endTime ranges for migration.
+const PRESET_TO_TIMES: Record<string, { startTime: string; endTime: string }> = {
+  office_occupancy:          { startTime: '08:00', endTime: '18:00' },
+  office_lighting:           { startTime: '08:00', endTime: '19:00' },
+  office_equipment:          { startTime: '09:00', endTime: '20:00' },
+  always_on:                 { startTime: '00:00', endTime: '23:59' },
+  intermittent:              { startTime: '09:00', endTime: '17:00' },
+  extended_office_occupancy: { startTime: '10:00', endTime: '23:00' },
+  early_morning_lighting:    { startTime: '06:00', endTime: '23:00' },
+};
+
 // Migrate old localStorage data (separate windows array) to new embedded format.
 // Also back-fills displayName so existing saved profiles get proper zone labels.
 const migrateProfile = (profile: any): ZoneProfile => {
@@ -79,9 +90,18 @@ const migrateProfile = (profile: any): ZoneProfile => {
     primarySubZones: ac.primarySubZones ?? [],
     spilloverSubZones: ac.spilloverSubZones ?? [],
   }));
+  // Migrate internalLoads: convert old schedulePreset → startTime/endTime
+  const migratedLoads = (profile.internalLoads || []).map((item: any) => {
+    if (item.startTime !== undefined) return item; // already new format
+    const times = PRESET_TO_TIMES[item.schedulePreset] ?? { startTime: '10:00', endTime: '23:00' };
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars
+    const { schedulePreset: _sp, liveCountKey: _lck, ...rest } = item;
+    return { ...rest, ...times };
+  });
   return {
     ...profile,
     ac: migratedAc,
+    internalLoads: migratedLoads,
     zone: { ...zone, walls: migratedWalls, subZones, ...(displayName ? { displayName } : {}) },
   };
 };
@@ -116,13 +136,13 @@ const DEFAULT_ZONE1: ZoneProfile = {
     { id: '1', name: 'Split AC Main', ratedCapacityWatts: 6200, iseer: 3.7, ageYears: 2 },
   ],
   internalLoads: [
-    { id: 'il-people',         label: 'People',        category: 'people',    count: 5,  wattsPerUnit: 130, schedulePreset: 'office_occupancy' },
-    { id: 'il-monitors',       label: 'Monitors',      category: 'equipment', count: 7,  wattsPerUnit: 30,  schedulePreset: 'office_equipment'  },
-    { id: 'il-printer',        label: 'Printer',       category: 'equipment', count: 1,  wattsPerUnit: 500, schedulePreset: 'intermittent'       },
-    { id: 'il-tube-lights',    label: 'Tube Lights',   category: 'lighting',  count: 19, wattsPerUnit: 40,  schedulePreset: 'office_lighting'    },
-    { id: 'il-fridge',         label: 'Fridge',        category: 'appliance', count: 1,  wattsPerUnit: 200, schedulePreset: 'always_on'          },
-    { id: 'il-fans',           label: 'Fans',          category: 'equipment', count: 3,  wattsPerUnit: 75,  schedulePreset: 'office_occupancy'   },
-    { id: 'il-ceiling-lights', label: 'Ceiling Lights',category: 'lighting',  count: 9,  wattsPerUnit: 15,  schedulePreset: 'office_lighting'    },
+    { id: 'il-people',         label: 'People',         category: 'people',    count: 5,  wattsPerUnit: 130, startTime: '10:00', endTime: '23:00' },
+    { id: 'il-monitors',       label: 'Monitors',       category: 'equipment', count: 7,  wattsPerUnit: 30,  startTime: '10:00', endTime: '23:00' },
+    { id: 'il-printer',        label: 'Printer',        category: 'equipment', count: 1,  wattsPerUnit: 500, startTime: '10:00', endTime: '17:00' },
+    { id: 'il-tube-lights',    label: 'Tube Lights',    category: 'lighting',  count: 19, wattsPerUnit: 40,  startTime: '06:00', endTime: '23:00' },
+    { id: 'il-fridge',         label: 'Fridge',         category: 'appliance', count: 1,  wattsPerUnit: 200, startTime: '00:00', endTime: '23:59' },
+    { id: 'il-fans',           label: 'Fans',           category: 'equipment', count: 3,  wattsPerUnit: 75,  startTime: '10:00', endTime: '23:00' },
+    { id: 'il-ceiling-lights', label: 'Ceiling Lights', category: 'lighting',  count: 9,  wattsPerUnit: 15,  startTime: '06:00', endTime: '23:00' },
   ] as InternalLoadItem[],
 };
 
@@ -143,7 +163,10 @@ const DEFAULT_ZONE2: ZoneProfile = {
     ],
   },
   ac: [],
-  internalLoads: [],
+  // No camera coverage — 1 person default during office hours
+  internalLoads: [
+    { id: 'z2-people', label: 'People', category: 'people', count: 1, wattsPerUnit: 130, startTime: '10:00', endTime: '23:00' },
+  ],
 };
 
 // ── Default Zone 3 — Meeting Room 1 (Living Things, Bangalore) ──────────────
@@ -163,7 +186,10 @@ const DEFAULT_ZONE3: ZoneProfile = {
     ],
   },
   ac: [],
-  internalLoads: [],
+  // No camera coverage — 1 person default during office hours
+  internalLoads: [
+    { id: 'z3-people', label: 'People', category: 'people', count: 1, wattsPerUnit: 130, startTime: '10:00', endTime: '23:00' },
+  ],
 };
 
 // ── Default Zone 4 — Unconditioned Corridor (elevator, reception, staircase, washroom) ──
@@ -282,6 +308,15 @@ function App() {
   const [allZoneAcOutputs, setAllZoneAcOutputs] = useState<Record<string, number[]>>({});
   // zoneId → full simulation result for ALL zones (used for zone-independent heat flow diagram)
   const [allZoneResults, setAllZoneResults] = useState<Record<string, SimulationResult>>({});
+  // Camera-based minute-level (1440-slot) people count per zone — null until fetched
+  const [cameraOccupancy, setCameraOccupancy] = useState<CameraOccupancyData | null>(null);
+
+  // Current IST minute slot (0–1439) — used to show live camera count in the People row
+  const currentISTSlot = (() => {
+    const ms = Date.now() + (5.5 * 60 * 60 * 1000);
+    const d = new Date(ms);
+    return d.getUTCHours() * 60 + d.getUTCMinutes();
+  })();
 
   // Sensor zone overrides: assetName → array of { zone, from } entries (timestamped moves).
   // e.g. { "Table_3": [{ zone: "Zone 2", from: "2026-03-14" }] }
@@ -433,7 +468,13 @@ function App() {
       const adjZoneTemps = Object.keys(allZoneTemps).length > 0
         ? Object.fromEntries(Object.entries(allZoneTemps).filter(([id]) => id !== (activeZoneId || zones[0]?.id))) as Record<string, number[]>
         : null;
-      const res = calculateHeatLoad(zone, acList, weather, location.lat, location.lon, realTemps, realAcOutputs, inventoryItems, adjZoneTemps);
+      const activeZoneIdStr = activeZoneId || zones[0]?.id || '';
+      const zoneMinuteOccupancy = cameraOccupancy
+        ? (activeZoneIdStr === 'zone1-default' ? cameraOccupancy.zone1
+          : activeZoneIdStr === 'zone4-default' ? cameraOccupancy.zone4
+          : null)
+        : null;
+      const res = calculateHeatLoad(zone, acList, weather, location.lat, location.lon, realTemps, realAcOutputs, inventoryItems, adjZoneTemps, null, zoneMinuteOccupancy);
       setResults(res);
       setWeatherError(null);
     } catch (error) {
@@ -443,7 +484,7 @@ function App() {
   // allZoneTemps is intentionally included: when adjacent zone temperatures arrive
   // (async, after first render) the simulation must re-run so zoneTransfers are populated.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [zone, acList, weather, location, historicalTemps, historicalAcOutput, activeProfile?.internalLoads, allZoneTemps]);
+  }, [zone, acList, weather, location, historicalTemps, historicalAcOutput, activeProfile?.internalLoads, allZoneTemps, cameraOccupancy]);
 
   // Compute simulation for ALL zones using shared weather — makes heat flow diagram zone-independent
   useEffect(() => {
@@ -463,10 +504,15 @@ function App() {
         const zoneAcOutputs = (allZoneAcOutputs[zp.id] && allZoneAcOutputs[zp.id].length > 0)
           ? allZoneAcOutputs[zp.id]
           : null;
+        const zpMinuteOccupancy = cameraOccupancy
+          ? (zp.id === 'zone1-default' ? cameraOccupancy.zone1
+            : zp.id === 'zone4-default' ? cameraOccupancy.zone4
+            : null)
+          : null;
         computed[zp.id] = calculateHeatLoad(
           zp.zone, zp.ac, weather, location.lat, location.lon,
           zoneSensorTemps, zoneAcOutputs,
-          zp.internalLoads, adjTemps
+          zp.internalLoads, adjTemps, null, zpMinuteOccupancy
         );
       } catch (e) {
         console.warn(`[allZoneResults] sim failed for zone ${zp.id}:`, e);
@@ -474,7 +520,7 @@ function App() {
     }
     setAllZoneResults(computed);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [weather, zones, location, allZoneTemps, allZoneAcOutputs]);
+  }, [weather, zones, location, allZoneTemps, allZoneAcOutputs, cameraOccupancy]);
 
   // Fetch hourly real temps and real AC output from DB whenever zone or selected date changes
   useEffect(() => {
@@ -491,6 +537,13 @@ function App() {
     };
     loadHistoricalData();
   }, [zone?.name, selectedDate]);
+
+  // Fetch camera-based minute-level occupancy whenever selected date changes.
+  // Zone 1 and Zone 4 counts come from camera data; Zone 2/3 use internalLoads defaults.
+  // Fallback: if no data for requested date, server returns earliest available date's pattern.
+  useEffect(() => {
+    fetchCameraOccupancy(selectedDate).then(setCameraOccupancy);
+  }, [selectedDate]);
 
   // Fetch sub-zone metadata whenever active zone changes (names, sensor counts, area suggestions)
   useEffect(() => {
@@ -761,7 +814,8 @@ function App() {
       category: 'equipment',
       count: 1,
       wattsPerUnit: 100,
-      schedulePreset: 'office_equipment',
+      startTime: '10:00',
+      endTime: '23:00',
     };
     updateActiveProfile({ internalLoads: [...internalLoadItems, newItem] });
   };
@@ -1680,23 +1734,50 @@ function App() {
 
               {/* ── INTERNAL LOADS SECTION ── */}
               {configSection === 'internal' && (() => {
-                const SCHEDULE_LABELS: Record<string, string> = {
-                  office_occupancy:          'Occupancy (8–18)',
-                  office_lighting:           'Lighting (8–18)',
-                  office_equipment:          'Equipment (9–17)',
-                  always_on:                 'Always On (24/7 · 60%)',
-                  intermittent:              'Intermittent (30%)',
-                  extended_office_occupancy: 'Extended (10am–11pm)',
-                  early_morning_lighting:    'Lighting (6am–11pm)',
-                };
                 const CATEGORY_COLORS: Record<string, string> = {
                   people:    'bg-orange-500/10 text-orange-400 border-orange-500/20',
                   lighting:  'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',
                   equipment: 'bg-blue-500/10 text-blue-400 border-blue-500/20',
                   appliance: 'bg-purple-500/10 text-purple-400 border-purple-500/20',
                 };
-                const peakRatedW = internalLoadItems.reduce((s, i) => s + i.count * i.wattsPerUnit, 0);
+                const inputCls = "bg-slate-900 border border-slate-700 rounded-lg py-1.5 px-2 text-white text-sm font-mono text-center focus:ring-2 focus:ring-blue-500 outline-none w-full";
                 const selectCls = "bg-slate-900 border border-slate-700 rounded-lg py-1.5 px-2 text-white text-xs focus:ring-2 focus:ring-blue-500 outline-none w-full";
+                const timeCls   = "bg-slate-900 border border-slate-700 rounded-lg py-1.5 px-2 text-white text-xs font-mono focus:ring-2 focus:ring-blue-500 outline-none w-full";
+
+                // Helper: is a given slot within item's active window?
+                const isActive = (item: InternalLoadItem, slot: number) => {
+                  const [sh, sm] = item.startTime.split(':').map(Number);
+                  const [eh, em] = item.endTime.split(':').map(Number);
+                  const s = sh * 60 + sm, e = eh * 60 + em;
+                  return s <= e ? (slot >= s && slot <= e) : (slot >= s || slot <= e);
+                };
+
+                // Per-item watt contribution at the current IST minute
+                const itemContribution = (item: InternalLoadItem) =>
+                  isActive(item, currentISTSlot) ? item.count * item.wattsPerUnit : 0;
+
+                // Current live count for People in camera-covered zones
+                const zoneId = activeZoneId || zones[0]?.id || '';
+                const hasCamZone = cameraOccupancy && (zoneId === 'zone1-default' || zoneId === 'zone4-default');
+                const getLiveCount = () => {
+                  if (!hasCamZone) return null;
+                  const arr = zoneId === 'zone1-default' ? cameraOccupancy!.zone1 : cameraOccupancy!.zone4;
+                  let c = arr[currentISTSlot];
+                  if (c === 0) { for (let s = currentISTSlot - 1; s >= 0; s--) { if (arr[s] > 0) { c = arr[s]; break; } } }
+                  return c;
+                };
+                const liveCount = getLiveCount();
+
+                const peopleItems = internalLoadItems.filter(i => i.category === 'people');
+                const otherItems  = internalLoadItems.filter(i => i.category !== 'people');
+
+                // Total active contribution at current minute (people from camera or time-range + other items)
+                const peopleContribW = hasCamZone
+                  ? (liveCount ?? 0) * (peopleItems[0]?.wattsPerUnit ?? 130)
+                  : peopleItems.reduce((s, i) => s + itemContribution(i), 0);
+                const otherContribW = otherItems.reduce((s, i) => s + itemContribution(i), 0);
+                const totalContribW = peopleContribW + otherContribW;
+
                 return (
                   <div className="space-y-6">
                     {/* Header */}
@@ -1706,7 +1787,7 @@ function App() {
                           <Flame size={16} className="text-orange-400" /> Internal Heat Sources
                         </h3>
                         <p className="text-xs text-slate-500 mt-1">
-                          Each item is multiplied by its schedule factor every hour.
+                          Set count &amp; active time window per item.
                           Heat is split into <span className="text-green-400">people</span>,{' '}
                           <span className="text-yellow-400">lighting</span>,{' '}
                           <span className="text-blue-400">equipment</span> &amp;{' '}
@@ -1725,11 +1806,10 @@ function App() {
                     <div className="flex items-center gap-2 px-3 py-2 bg-green-900/20 border border-green-800/40 rounded-lg text-xs text-green-400">
                       <Activity size={13} />
                       {internalLoadItems.length > 0
-                        ? 'Using inventory-based scheduled method — overrides generic W/m² density estimate'
+                        ? 'Using inventory-based time-range method — overrides generic W/m² density estimate'
                         : 'No inventory — falling back to generic W/m² density estimate'}
                     </div>
 
-                    {/* Item list */}
                     {internalLoadItems.length === 0 ? (
                       <div className="py-12 border-2 border-dashed border-slate-800 rounded-2xl flex flex-col items-center justify-center text-slate-500 gap-3">
                         <Flame size={36} className="opacity-20" />
@@ -1737,109 +1817,166 @@ function App() {
                         <button onClick={addInternalLoadItem} className="text-blue-400 hover:text-blue-300 text-sm font-medium">Click to add your first item</button>
                       </div>
                     ) : (
-                      <div className="space-y-3">
-                        {/* Column headers */}
-                        <div className="hidden md:grid grid-cols-[1fr_110px_80px_80px_1fr_60px_28px] gap-3 px-4 text-[10px] text-slate-500 uppercase font-bold tracking-widest">
-                          <span>Label</span><span>Category</span><span>Count</span><span>W/unit</span><span>Schedule</span><span className="text-right">Peak W</span><span />
-                        </div>
+                      <div className="space-y-4">
 
-                        {internalLoadItems.map((item) => (
-                          <div key={item.id} className="bg-slate-950/50 border border-slate-800 rounded-xl p-3 grid grid-cols-1 md:grid-cols-[1fr_110px_80px_80px_1fr_60px_28px] gap-3 items-center hover:border-slate-700 transition-colors">
-
-                            {/* Label */}
-                            <input
-                              type="text"
-                              value={item.label}
-                              onChange={e => updateInternalLoadItem(item.id, 'label', e.target.value)}
-                              className="bg-slate-900 border border-slate-700 rounded-lg py-1.5 px-3 text-white text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full"
-                              placeholder="Label"
-                            />
-
-                            {/* Category */}
-                            <select
-                              value={item.category}
-                              onChange={e => updateInternalLoadItem(item.id, 'category', e.target.value)}
-                              className={selectCls}
-                            >
-                              <option value="people">People</option>
-                              <option value="lighting">Lighting</option>
-                              <option value="equipment">Equipment</option>
-                              <option value="appliance">Appliance</option>
-                            </select>
-
-                            {/* Count */}
-                            <input
-                              type="number"
-                              min={0}
-                              value={item.count}
-                              onChange={e => updateInternalLoadItem(item.id, 'count', Number(e.target.value))}
-                              className="bg-slate-900 border border-slate-700 rounded-lg py-1.5 px-2 text-white text-sm font-mono text-center focus:ring-2 focus:ring-blue-500 outline-none w-full"
-                            />
-
-                            {/* Watts per unit */}
-                            <div className="relative">
-                              <input
-                                type="number"
-                                min={0}
-                                value={item.wattsPerUnit}
-                                onChange={e => updateInternalLoadItem(item.id, 'wattsPerUnit', Number(e.target.value))}
-                                className="bg-slate-900 border border-slate-700 rounded-lg py-1.5 pl-2 pr-7 text-white text-sm font-mono text-center focus:ring-2 focus:ring-blue-500 outline-none w-full"
-                              />
-                              <span className="absolute right-2 top-1.5 text-slate-500 text-xs pointer-events-none">W</span>
+                        {/* ── People section (separate, live from cameras) ── */}
+                        {peopleItems.length > 0 && (
+                          <div className="bg-orange-950/20 border border-orange-800/30 rounded-xl p-4 space-y-3">
+                            <div className="flex items-center justify-between">
+                              <p className="text-xs font-bold text-orange-400 uppercase tracking-widest flex items-center gap-1.5">
+                                <span>👥</span> People
+                              </p>
+                              {hasCamZone && (
+                                <span className="text-[10px] text-orange-400/70 italic">Live from cameras — updates every minute</span>
+                              )}
                             </div>
-
-                            {/* Schedule preset */}
-                            <select
-                              value={item.schedulePreset}
-                              onChange={e => updateInternalLoadItem(item.id, 'schedulePreset', e.target.value)}
-                              className={selectCls}
-                            >
-                              {Object.entries(SCHEDULE_LABELS).map(([val, lbl]) => (
-                                <option key={val} value={val}>{lbl}</option>
-                              ))}
-                            </select>
-
-                            {/* Peak watts (count × W/unit) */}
-                            <div className="text-right">
-                              <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded border ${CATEGORY_COLORS[item.category]}`}>
-                                {(item.count * item.wattsPerUnit).toLocaleString()} W
-                              </span>
-                            </div>
-
-                            {/* Remove */}
-                            <button
-                              onClick={() => removeInternalLoadItem(item.id)}
-                              className="text-slate-600 hover:text-red-500 transition-colors flex justify-center"
-                              title="Remove item"
-                            >
-                              <Trash2 size={14} />
-                            </button>
+                            {peopleItems.map(item => (
+                              <div key={item.id} className="grid grid-cols-1 md:grid-cols-[1fr_80px_80px_auto_28px] gap-3 items-center">
+                                {/* Label */}
+                                <input type="text" value={item.label}
+                                  onChange={e => updateInternalLoadItem(item.id, 'label', e.target.value)}
+                                  className="bg-slate-900 border border-slate-700 rounded-lg py-1.5 px-3 text-white text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full"
+                                  placeholder="Label" />
+                                {/* Count — cam badge or editable */}
+                                {hasCamZone ? (
+                                  <div className="relative" title="Live count from cameras">
+                                    <div className="bg-slate-900 border border-orange-500/60 rounded-lg py-1.5 px-2 text-orange-400 text-sm font-mono text-center w-full select-none">
+                                      {liveCount ?? 0}
+                                    </div>
+                                    <span className="absolute -top-1.5 -right-1.5 text-[9px] bg-orange-600 text-white rounded-full px-1 leading-4 pointer-events-none">cam</span>
+                                  </div>
+                                ) : (
+                                  <input type="number" min={0} value={item.count}
+                                    onChange={e => updateInternalLoadItem(item.id, 'count', Number(e.target.value))}
+                                    className={inputCls} />
+                                )}
+                                {/* W/unit */}
+                                <div className="relative">
+                                  <input type="number" min={0} value={item.wattsPerUnit}
+                                    onChange={e => updateInternalLoadItem(item.id, 'wattsPerUnit', Number(e.target.value))}
+                                    className="bg-slate-900 border border-slate-700 rounded-lg py-1.5 pl-2 pr-6 text-white text-sm font-mono text-center focus:ring-2 focus:ring-blue-500 outline-none w-full" />
+                                  <span className="absolute right-2 top-1.5 text-slate-500 text-xs pointer-events-none">W</span>
+                                </div>
+                                {/* Contribution */}
+                                <div className="text-right">
+                                  <span className="text-xs font-mono font-bold px-2 py-0.5 rounded border bg-orange-500/10 text-orange-400 border-orange-500/20">
+                                    {peopleContribW.toLocaleString()} W now
+                                  </span>
+                                </div>
+                                {/* Remove */}
+                                <button onClick={() => removeInternalLoadItem(item.id)}
+                                  className="text-slate-600 hover:text-red-500 transition-colors flex justify-center" title="Remove">
+                                  <Trash2 size={14} />
+                                </button>
+                              </div>
+                            ))}
+                            {!hasCamZone && peopleItems.map(item => (
+                              <div key={`tr-${item.id}`} className="flex items-center gap-2 text-xs text-slate-400">
+                                <span>Active</span>
+                                <input type="time" value={item.startTime}
+                                  onChange={e => updateInternalLoadItem(item.id, 'startTime', e.target.value)}
+                                  className={timeCls + ' w-28'} />
+                                <span>to</span>
+                                <input type="time" value={item.endTime}
+                                  onChange={e => updateInternalLoadItem(item.id, 'endTime', e.target.value)}
+                                  className={timeCls + ' w-28'} />
+                              </div>
+                            ))}
                           </div>
-                        ))}
+                        )}
+
+                        {/* ── Other items table ── */}
+                        {otherItems.length > 0 && (
+                          <div className="space-y-2">
+                            <div className="hidden md:grid grid-cols-[1fr_110px_70px_70px_85px_85px_80px_28px] gap-2 px-3 text-[10px] text-slate-500 uppercase font-bold tracking-widest">
+                              <span>Label</span><span>Category</span><span>Count</span><span>W/Unit</span><span>Start</span><span>End</span><span className="text-right">Contribution</span><span />
+                            </div>
+                            {otherItems.map(item => {
+                              const contribW = itemContribution(item);
+                              const active   = isActive(item, currentISTSlot);
+                              return (
+                                <div key={item.id} className={`border rounded-xl p-3 grid grid-cols-1 md:grid-cols-[1fr_110px_70px_70px_85px_85px_80px_28px] gap-2 items-center transition-colors ${active ? 'bg-slate-950/50 border-slate-700' : 'bg-slate-950/20 border-slate-800 opacity-60'}`}>
+                                  {/* Label */}
+                                  <input type="text" value={item.label}
+                                    onChange={e => updateInternalLoadItem(item.id, 'label', e.target.value)}
+                                    className="bg-slate-900 border border-slate-700 rounded-lg py-1.5 px-3 text-white text-sm focus:ring-2 focus:ring-blue-500 outline-none w-full"
+                                    placeholder="Label" />
+                                  {/* Category */}
+                                  <select value={item.category}
+                                    onChange={e => updateInternalLoadItem(item.id, 'category', e.target.value)}
+                                    className={selectCls}>
+                                    <option value="lighting">Lighting</option>
+                                    <option value="equipment">Equipment</option>
+                                    <option value="appliance">Appliance</option>
+                                  </select>
+                                  {/* Count */}
+                                  <input type="number" min={0} value={item.count}
+                                    onChange={e => updateInternalLoadItem(item.id, 'count', Number(e.target.value))}
+                                    className={inputCls} />
+                                  {/* W/unit */}
+                                  <div className="relative">
+                                    <input type="number" min={0} value={item.wattsPerUnit}
+                                      onChange={e => updateInternalLoadItem(item.id, 'wattsPerUnit', Number(e.target.value))}
+                                      className="bg-slate-900 border border-slate-700 rounded-lg py-1.5 pl-2 pr-6 text-white text-sm font-mono text-center focus:ring-2 focus:ring-blue-500 outline-none w-full" />
+                                    <span className="absolute right-1.5 top-1.5 text-slate-500 text-xs pointer-events-none">W</span>
+                                  </div>
+                                  {/* Start time */}
+                                  <input type="time" value={item.startTime}
+                                    onChange={e => updateInternalLoadItem(item.id, 'startTime', e.target.value)}
+                                    className={timeCls} />
+                                  {/* End time */}
+                                  <input type="time" value={item.endTime}
+                                    onChange={e => updateInternalLoadItem(item.id, 'endTime', e.target.value)}
+                                    className={timeCls} />
+                                  {/* Contribution */}
+                                  <div className="text-right">
+                                    <span className={`text-xs font-mono font-bold px-2 py-0.5 rounded border ${CATEGORY_COLORS[item.category]}`}>
+                                      {contribW > 0 ? `${contribW.toLocaleString()} W` : '—'}
+                                    </span>
+                                  </div>
+                                  {/* Remove */}
+                                  <button onClick={() => removeInternalLoadItem(item.id)}
+                                    className="text-slate-600 hover:text-red-500 transition-colors flex justify-center" title="Remove">
+                                    <Trash2 size={14} />
+                                  </button>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
                     )}
 
                     {/* Summary footer */}
                     {internalLoadItems.length > 0 && (
-                      <div className="border-t border-slate-800 pt-4 grid grid-cols-2 md:grid-cols-4 gap-4">
-                        {(['people', 'lighting', 'equipment', 'appliance'] as const).map(cat => {
-                          const catW = internalLoadItems
-                            .filter(i => i.category === cat)
-                            .reduce((s, i) => s + i.count * i.wattsPerUnit, 0);
-                          if (catW === 0) return null;
-                          return (
-                            <div key={cat} className={`p-3 rounded-xl border ${CATEGORY_COLORS[cat]} bg-opacity-10`}>
-                              <p className="text-[10px] uppercase font-bold tracking-widest capitalize mb-1">{cat}</p>
-                              <p className="text-lg font-mono font-bold">{catW.toLocaleString()} W</p>
+                      <div className="border-t border-slate-800 pt-4 space-y-3">
+                        <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                          {(['lighting', 'equipment', 'appliance'] as const).map(cat => {
+                            const catW = otherItems.filter(i => i.category === cat).reduce((s, i) => s + itemContribution(i), 0);
+                            const totalCatW = otherItems.filter(i => i.category === cat).reduce((s, i) => s + i.count * i.wattsPerUnit, 0);
+                            if (totalCatW === 0) return null;
+                            return (
+                              <div key={cat} className={`p-3 rounded-xl border ${CATEGORY_COLORS[cat]}`}>
+                                <p className="text-[10px] uppercase font-bold tracking-widest capitalize mb-1">{cat}</p>
+                                <p className="text-lg font-mono font-bold">{catW.toLocaleString()} W</p>
+                                <p className="text-[10px] opacity-60 mt-0.5">of {totalCatW.toLocaleString()} W rated</p>
+                              </div>
+                            );
+                          })}
+                          {peopleItems.length > 0 && (
+                            <div className="p-3 rounded-xl border bg-orange-500/10 text-orange-400 border-orange-500/20">
+                              <p className="text-[10px] uppercase font-bold tracking-widest mb-1">People</p>
+                              <p className="text-lg font-mono font-bold">{peopleContribW.toLocaleString()} W</p>
+                              <p className="text-[10px] opacity-60 mt-0.5">{hasCamZone ? `${liveCount ?? 0} people live` : 'scheduled'}</p>
                             </div>
-                          );
-                        })}
-                        <div className="col-span-2 md:col-span-4 p-4 bg-slate-800 rounded-xl flex justify-between items-center">
+                          )}
+                        </div>
+                        <div className="p-4 bg-slate-800 rounded-xl flex justify-between items-center">
                           <div>
-                            <p className="text-xs text-slate-400 uppercase font-bold tracking-widest">Rated Peak Total</p>
-                            <p className="text-[10px] text-slate-500 mt-0.5">at schedule factor = 1.0 · actual output varies by hour</p>
+                            <p className="text-xs text-slate-400 uppercase font-bold tracking-widest">Total Internal Load Now</p>
+                            <p className="text-[10px] text-slate-500 mt-0.5">sum of all active items at current minute</p>
                           </div>
-                          <p className="text-2xl font-mono font-bold text-white">{peakRatedW.toLocaleString()} <span className="text-sm font-normal text-slate-400">W</span></p>
+                          <p className="text-2xl font-mono font-bold text-white">{totalContribW.toLocaleString()} <span className="text-sm font-normal text-slate-400">W</span></p>
                         </div>
                       </div>
                     )}

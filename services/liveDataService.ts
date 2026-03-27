@@ -280,6 +280,39 @@ export async function fetchAllLiveSensors(): Promise<AllSensorsData | null> {
  * @param zone - App zone name e.g. "Zone 1"
  * @param date - ISO date string YYYY-MM-DD (default: today in IST)
  */
+export interface CameraOccupancyData {
+  date: string;                 // actual date data was sourced from (may differ if fallback used)
+  usingFallbackDate: boolean;   // true if requested date had no data
+  fallbackDate: string | null;  // earliest available date used as fallback, or null
+  zone1: number[];              // 1440-slot people count for Zone 1 (Main Working Area)
+  zone4: number[];              // 1440-slot people count for Zone 4 (Reception)
+}
+
+/**
+ * Fetches minute-level (1440-slot) people count from camera data for Zone 1 and Zone 4.
+ * Zone 2 (Pantry) and Zone 3 (Meeting Room) have no cameras — use their internalLoads defaults.
+ *
+ * If no camera data exists for the requested date, the earliest available date is used
+ * as a fallback (same time-of-day occupancy pattern applied to the target date).
+ *
+ * @param date - ISO date string YYYY-MM-DD (default: today in IST)
+ */
+export async function fetchCameraOccupancy(date?: string): Promise<CameraOccupancyData | null> {
+  try {
+    const params = new URLSearchParams();
+    if (date) params.set('date', date);
+    const response = await fetch(`/api/camera-occupancy?${params}`);
+    if (!response.ok) {
+      console.warn(`[liveDataService] camera-occupancy API returned ${response.status}`);
+      return null;
+    }
+    return await response.json() as CameraOccupancyData;
+  } catch (err) {
+    console.warn('[liveDataService] Failed to fetch camera occupancy:', err);
+    return null;
+  }
+}
+
 export async function fetchHistoricalAcOutput(
   zone = 'Zone 1',
   date?: string,

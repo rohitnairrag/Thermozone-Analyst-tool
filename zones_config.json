@@ -1,12 +1,12 @@
 {
-  "savedAt": "2026-03-19T08:41:34.868Z",
+  "savedAt": "2026-03-27T09:10:38.901Z",
   "zones": [
     {
       "id": "zone1-default",
       "zone": {
         "name": "Zone 1",
         "ceilingHeightM": 3,
-        "isTopFloor": false,
+        "isTopFloor": true,
         "walls": [
           {
             "id": "w1",
@@ -200,32 +200,35 @@
           "category": "people",
           "count": 7,
           "wattsPerUnit": 130,
-          "schedulePreset": "extended_office_occupancy",
-          "liveCountKey": "occupancy_zone1"
+          "startTime": "10:00",
+          "endTime": "23:00"
         },
         {
           "id": "il-monitors",
           "label": "Monitors",
           "category": "equipment",
-          "count": 4,
+          "count": 7,
           "wattsPerUnit": 30,
-          "schedulePreset": "extended_office_occupancy"
+          "startTime": "10:00",
+          "endTime": "23:00"
         },
         {
           "id": "il-laptops",
           "label": "Laptops",
           "category": "equipment",
-          "count": 3,
+          "count": 7,
           "wattsPerUnit": 50,
-          "schedulePreset": "extended_office_occupancy"
+          "startTime": "10:00",
+          "endTime": "23:00"
         },
         {
           "id": "il-tube-lights",
           "label": "Tube Lights",
           "category": "lighting",
-          "count": 19,
+          "count": 4,
           "wattsPerUnit": 40,
-          "schedulePreset": "early_morning_lighting"
+          "startTime": "18:00",
+          "endTime": "23:00"
         },
         {
           "id": "il-ceiling-lights",
@@ -233,7 +236,8 @@
           "category": "lighting",
           "count": 0,
           "wattsPerUnit": 15,
-          "schedulePreset": "early_morning_lighting"
+          "startTime": "18:00",
+          "endTime": "23:00"
         },
         {
           "id": "il-fans",
@@ -241,7 +245,8 @@
           "category": "equipment",
           "count": 1,
           "wattsPerUnit": 75,
-          "schedulePreset": "extended_office_occupancy"
+          "startTime": "10:00",
+          "endTime": "23:00"
         },
         {
           "id": "il-cooler",
@@ -249,15 +254,17 @@
           "category": "appliance",
           "count": 1,
           "wattsPerUnit": 150,
-          "schedulePreset": "extended_office_occupancy"
+          "startTime": "10:00",
+          "endTime": "23:00"
         },
         {
           "id": "il-fridge",
           "label": "Fridge",
           "category": "appliance",
-          "count": 0,
+          "count": 1,
           "wattsPerUnit": 200,
-          "schedulePreset": "always_on"
+          "startTime": "10:00",
+          "endTime": "23:59"
         }
       ],
       "sensorPositions": {
@@ -435,7 +442,8 @@
         "AC1": "ac_level",
         "AC2": "ac_level",
         "sensor 4 (conf room)": "desk"
-      }
+      },
+      "internalLoads": []
     },
     {
       "id": "zone4-default",
@@ -524,7 +532,8 @@
         "displayName": "Corridor & Reception",
         "subZones": []
       },
-      "ac": []
+      "ac": [],
+      "internalLoads": []
     }
   ],
   "sensorZoneOverrides": {}
