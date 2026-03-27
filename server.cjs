@@ -698,6 +698,227 @@ app.post('/api/zones/config', (req, res) => {
   }
 });
 
+// ─── Camera Occupancy ─────────────────────────────────────────────────────────
+// Camera-to-zone mapping (camera_id → which sub-areas they cover):
+//   cam 5, 8  → Working Area 1 (Zone 1 sub-zone)
+//   cam 1,3,7 → Working Area 2 (Zone 1 sub-zone)
+//   cam 4     → Working Area 2 + Embedded Team combined (Zone 1 sub-zones)
+//   cam 2     → Reception (Zone 4)
+//   No cameras in Pantry (Zone 2) or Meeting Room 1 (Zone 3) — defaults used there.
+//
+// Zone 1 total count formula (avoids double-counting):
+//   WA1     = MAX(cam5, cam8)
+//   WA2+ET  = MAX(cam4, cam1, cam3, cam7)
+//     (cam4 sees WA2+ET combined; cams 1,3,7 see WA2 only; taking max gives WA2+ET)
+//   Zone 1  = WA1 + WA2+ET
+//
+// Zone 4 count = cam2
+
+// GET /api/camera-occupancy?date=YYYY-MM-DD
+// Returns 1440-slot (per-minute) people counts for Zone 1 and Zone 4.
+//
+// Date resolution rules:
+//   1. Requested date < earliest camera date  → historical pattern: use earliest available date
+//   2. Requested date ≥ earliest camera date but NO data that day → holiday: return all 0s
+//   3. Requested date has camera data → use it directly
+//
+// Safety guards applied after data is fetched:
+//   • Slots 0–599 (midnight–9:59 AM): use live camera count if data exists; zero if no data
+//   • Late camera start backfill: if first camera reading after 10 AM has a gap (e.g. camera
+//     comes online at 11 AM), slots 600 → (first reading − 1) are filled with the PREVIOUS
+//     DAY's counts for those same minute slots (more realistic than repeating today's first peak).
+app.get('/api/camera-occupancy', async (req, res) => {
+  try {
+    const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    let date = (req.query.date && /^\d{4}-\d{2}-\d{2}$/.test(req.query.date))
+      ? req.query.date
+      : todayIST;
+
+    // Fetch earliest available date and check if requested date has data — run in parallel
+    const [earliestResult, checkResult] = await Promise.all([
+      db.query(`SELECT MIN(DATE(timestamp))::TEXT AS earliest FROM cameralogstest`),
+      db.query(`SELECT COUNT(*) FROM cameralogstest WHERE DATE(timestamp) = $1::DATE`, [date]),
+    ]);
+
+    const earliestDate = earliestResult.rows[0]?.earliest ?? null;
+    const hasData = parseInt(checkResult.rows[0].count) > 0;
+
+    let usingFallbackDate = false;
+    let fallbackDate = null;
+
+    if (!hasData) {
+      if (earliestDate && date < earliestDate) {
+        // Rule 1: before cameras were installed → use earliest date as historical pattern
+        fallbackDate = earliestDate;
+        date = earliestDate;
+        usingFallbackDate = true;
+      } else {
+        // Rule 2: within camera era but no data (holiday / office closed) → return all zeros
+        return res.json({
+          date,
+          usingFallbackDate: false,
+          fallbackDate: null,
+          isHoliday: true,
+          zone1: new Array(1440).fill(0),
+          zone4: new Array(1440).fill(0),
+        });
+      }
+    }
+
+    // Query per-minute MAX count per camera for the resolved date.
+    // timestamp is stored as IST (TIMESTAMP WITHOUT TIME ZONE) — no offset needed.
+    const result = await db.query(`
+      SELECT
+        camera_id,
+        (EXTRACT(HOUR FROM timestamp) * 60 + EXTRACT(MINUTE FROM timestamp))::INT AS slot,
+        MAX(count)::INT AS max_count
+      FROM cameralogstest
+      WHERE DATE(timestamp) = $1::DATE
+      GROUP BY camera_id, slot
+      ORDER BY slot, camera_id
+    `, [date]);
+
+    // ── Helper: build camera slot map from query rows ────────────────────────
+    const buildCamSlots = (rows) => {
+      const m = {};
+      for (const r of rows) {
+        if (!m[r.camera_id]) m[r.camera_id] = {};
+        m[r.camera_id][r.slot] = r.max_count;
+      }
+      return m;
+    };
+
+    // ── Helper: apply zone formulas for one slot ──────────────────────────────
+    const computeZoneSlots = (camSlots) => {
+      const getCount = (id, s) => camSlots[id]?.[s] ?? 0;
+      const zone1 = new Array(1440).fill(0);
+      const zone4 = new Array(1440).fill(0);
+      for (let slot = 0; slot < 1440; slot++) {
+        // Zone 1: cameras cover non-overlapping areas, so SUM (not MAX) gives the best headcount.
+        // People are stationary at desks; at any given minute each person is in one camera's frame only.
+        // WA1 = cam5 + cam8;  WA2+ET = cam4 + cam1 + cam3 + cam7
+        const wa1   = getCount('5', slot) + getCount('8', slot);
+        const wa2et = getCount('4', slot) + getCount('1', slot) + getCount('3', slot) + getCount('7', slot);
+        zone1[slot] = wa1 + wa2et;
+        // Zone 4: Reception = cam2
+        zone4[slot] = getCount('2', slot);
+      }
+      return { zone1, zone4 };
+    };
+
+    // Build today's zone arrays — no hard pre-10-AM block:
+    //   slots 0–599 with camera data → use it (camera may detect arrivals/cleaning)
+    //   slots 0–599 with no camera data → naturally stay 0
+    const todayCamSlots = buildCamSlots(result.rows);
+    const { zone1, zone4 } = computeZoneSlots(todayCamSlots);
+
+    // ── Late camera start: backfill gap with PREVIOUS DAY's data ─────────────
+    // If the first camera reading on a given day comes after 10:00 AM (slot 600),
+    // fill the gap [600 … firstSlot-1] using the equivalent slots from yesterday.
+    // Using yesterday's real counts (same time-of-day) is more realistic than
+    // repeating today's first reading or leaving the gap as zero.
+    const OFFICE_START_SLOT = 600; // 10:00 AM
+
+    const gapEnd = (arr) => {
+      for (let s = OFFICE_START_SLOT; s < 1440; s++) { if (arr[s] > 0) return s; }
+      return -1; // no data from 10 AM onwards
+    };
+
+    const z1Gap = gapEnd(zone1); // -1 = no data; 600 = no gap; >600 = gap exists
+    const z4Gap = gapEnd(zone4);
+    const hasGap = (z1Gap > OFFICE_START_SLOT) || (z4Gap > OFFICE_START_SLOT);
+
+    if (hasGap) {
+      // Calculate yesterday relative to the resolved date
+      const dateObj = new Date(date + 'T12:00:00Z');
+      dateObj.setUTCDate(dateObj.getUTCDate() - 1);
+      const yesterday = dateObj.toISOString().slice(0, 10);
+
+      const yResult = await db.query(`
+        SELECT
+          camera_id,
+          (EXTRACT(HOUR FROM timestamp) * 60 + EXTRACT(MINUTE FROM timestamp))::INT AS slot,
+          MAX(count)::INT AS max_count
+        FROM cameralogstest
+        WHERE DATE(timestamp) = $1::DATE
+        GROUP BY camera_id, slot
+      `, [yesterday]);
+
+      const { zone1: yZone1, zone4: yZone4 } = computeZoneSlots(buildCamSlots(yResult.rows));
+
+      // Fill the gap slots with yesterday's counts (0 if yesterday also had no data)
+      if (z1Gap > OFFICE_START_SLOT) {
+        for (let s = OFFICE_START_SLOT; s < z1Gap; s++) zone1[s] = yZone1[s];
+      }
+      if (z4Gap > OFFICE_START_SLOT) {
+        for (let s = OFFICE_START_SLOT; s < z4Gap; s++) zone4[s] = yZone4[s];
+      }
+    }
+
+    // ── Carry-forward fill ────────────────────────────────────────────────────
+    // Cameras fire every ~20s; many minute-slots have 0 between readings.
+    // Carry the last known count for up to 5 consecutive zero slots so the
+    // physics engine sees realistic occupancy instead of a sparse spike signal.
+    // A gap longer than 5 slots is treated as genuinely empty (person left).
+    const carryForwardFill = (arr, maxGap = 5) => {
+      let lastVal = 0;
+      let gapCount = 0;
+      for (let s = 0; s < 1440; s++) {
+        if (arr[s] > 0) {
+          lastVal = arr[s];
+          gapCount = 0;
+        } else {
+          gapCount++;
+          if (lastVal > 0 && gapCount <= maxGap) {
+            arr[s] = lastVal;
+          } else if (gapCount > maxGap) {
+            lastVal = 0; // genuine empty period — stop carrying
+          }
+        }
+      }
+    };
+    carryForwardFill(zone1, 30);
+    carryForwardFill(zone4, 30);
+
+    return res.json({
+      date,
+      usingFallbackDate,
+      fallbackDate,
+      isHoliday: false,
+      zone1,   // 1440-slot people count for Zone 1 (Main Working Area)
+      zone4,   // 1440-slot people count for Zone 4 (Reception)
+    });
+  } catch (err) {
+    console.error('[camera-occupancy] DB error:', err.message);
+    return res.status(500).json({ error: 'Database query failed', detail: err.message });
+  }
+});
+
+// ─── Camera debug: per-camera counts for recent slots ─────────────────────────
+app.get('/api/camera-debug', async (req, res) => {
+  try {
+    const todayIST = new Date().toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
+    const nowIST   = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
+    const curSlot  = nowIST.getUTCHours() * 60 + nowIST.getUTCMinutes();
+    const fromSlot = Math.max(0, curSlot - 5);
+    const result = await db.query(`
+      SELECT camera_id, slot, max_count FROM (
+        SELECT camera_id,
+               (EXTRACT(HOUR FROM timestamp)*60 + EXTRACT(MINUTE FROM timestamp))::INT AS slot,
+               MAX(count)::INT AS max_count
+        FROM cameralogstest
+        WHERE DATE(timestamp) = $1::DATE
+        GROUP BY camera_id, slot
+      ) t
+      WHERE slot >= $2 AND slot <= $3
+      ORDER BY slot, camera_id
+    `, [todayIST, fromSlot, curSlot]);
+    res.json({ currentSlot: curSlot, rows: result.rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── Health check ─────────────────────────────────────────────────────────────
 app.get('/api/health', (_, res) => res.json({ status: 'ok', ts: new Date().toISOString() }));
 

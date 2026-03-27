@@ -1,7 +1,21 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm install:*)"
+      "Bash(npm install:*)",
+      "Read(//c/Users/Admin/AppData/Roaming/Claude/local-agent-mode-sessions/skills-plugin/7880d2a5-a4fc-4138-8486-8ae832f2d60c/831e1427-4da4-479b-a004-7325102e13ce/skills/docx/**)",
+      "Bash(node make_eng_review.js)",
+      "Bash(python scripts/office/validate.py \"C:\\\\Users\\\\Admin\\\\OneDrive\\\\Desktop\\\\thermozone_analyst\\\\ThermoZone_Engineering_Review.docx\")",
+      "Bash(pip install:*)",
+      "Bash(find C:UsersAdminOneDriveDesktopthermozone_analyst.claudeworktreesbusy-kirch -type f \\\\\\(-name *.py -o -name *pgpass* -o -name *database* -o -name *db* \\\\\\))",
+      "Read(//c/Users/Admin/OneDrive/Desktop/thermozone_analyst/**)",
+      "Bash(node -e \":*)",
+      "Bash(npm run:*)",
+      "mcp__Claude_Preview__preview_start",
+      "Bash(taskkill /PID 4280 /F)",
+      "Bash(taskkill /PID 4864 /F)",
+      "Bash(cmd /c \"taskkill /PID 4280 /F\")",
+      "Bash(cmd /c \"taskkill /PID 4864 /F\")",
+      "Bash(cmd /c \"taskkill /PID 4280 /F 2>&1\")"
     ]
   }
 }

@@ -69,26 +69,6 @@ export interface LocationData {
   lon: number;
 }
 
-/**
- * Schedule preset for an internal load item.
- *
- * office_occupancy          – people ramp 8→9, full 10-16, ramp 17→18, off after
- * office_lighting           – on 8-18 with 0.4 shoulders; off outside
- * office_equipment          – 0.1 standby at night, full 9-17, taper 18-20
- * always_on                 – 0.6 duty cycle all 24 h (e.g. fridge compressor cycling)
- * intermittent              – office hours only, 0.3 avg utilisation (e.g. printer)
- * extended_office_occupancy – 10am full until 11pm (actual Living Things Bangalore schedule)
- * early_morning_lighting    – on from 6am, full during office hours, off after 11pm
- */
-export type SchedulePreset =
-  | 'office_occupancy'
-  | 'office_lighting'
-  | 'office_equipment'
-  | 'always_on'
-  | 'intermittent'
-  | 'extended_office_occupancy'
-  | 'early_morning_lighting';
-
 /** A single type of heat-generating item inside the zone (used for inventory-based internal loads). */
 export interface InternalLoadItem {
   id: string;
@@ -98,14 +78,9 @@ export interface InternalLoadItem {
   count: number;
   /** Rated heat output per unit in Watts */
   wattsPerUnit: number;
-  schedulePreset: SchedulePreset;
-  /**
-   * Optional key for live-data override of `count`.
-   * When live occupancy data is available (e.g. from DB), the engine looks up this key
-   * in a `liveOccupancy` map and substitutes the live value instead of the default count.
-   * Example: liveCountKey = "occupancy_zone1" → liveOccupancy["occupancy_zone1"] = 6
-   */
-  liveCountKey?: string;
+  /** Active time window — "HH:MM" 24-hour strings, both inclusive */
+  startTime: string;  // e.g. "10:00"
+  endTime:   string;  // e.g. "23:00"
 }
 
 export interface ZoneProfile {

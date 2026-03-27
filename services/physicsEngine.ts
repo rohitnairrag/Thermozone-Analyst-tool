@@ -1,6 +1,6 @@
 import { ZoneParams, ACUnit, SimulationResult, SimulationDataPoint, HourlyWeather, InternalLoadItem, ZoneTransferEntry } from '../types';
 import { computeFloorArea } from './geometry';
-import { computeScheduledInternalLoads } from './internalLoadScheduler';
+import { computeTimeRangeInternalLoads } from './internalLoadScheduler';
 
 // Shared envelope U-values (W/m²·K) — imported by HeatFlowDiagram to keep constants in sync
 export const U_GLASS = 2.7;  // double-glazed tinted glass
@@ -17,6 +17,7 @@ export const calculateHeatLoad = (
   internalLoadItems?: InternalLoadItem[],         // optional per-unit inventory; replaces W/m² density method when provided
   adjacentZoneTemps: Record<string, number[]> | null = null,  // zoneId → 24-hr temp array for adjacent zone heat transfer
   initialTempC: number | null = null,             // real starting indoor temp (e.g. yesterday's last sensor reading); overrides the 24°C default
+  minuteOccupancy: number[] | null = null,        // 1440-slot camera count array; overrides scheduled people load for slots > 0 only
 ): SimulationResult => {
   if (!weather || !weather.temperature) {
     throw new Error("Weather data missing from API.");
@@ -204,11 +205,17 @@ export const calculateHeatLoad = (
     const qInf = massFlowRate * (hOut - hInDynamic) * 1000;
     inf += qInf;
 
-    // 2. Internal Gains — schedule lookup uses integer hour (h0)
+    // 2. Internal Gains — time-range check uses minute-level slot (0–1439)
     if (internalLoadItems && internalLoadItems.length > 0) {
-      // ── Inventory / scheduled approach ────────────────────────────────────
-      const sched = computeScheduledInternalLoads(internalLoadItems, h0);
-      people            += sched.people;
+      // ── Inventory / time-range approach ───────────────────────────────────
+      const sched = computeTimeRangeInternalLoads(internalLoadItems, slot);
+      // Camera overrides people load only when > 0 (filled slots).
+      // 0-valued slots (genuine absence or future) fall back to the inventory People item.
+      if (minuteOccupancy && minuteOccupancy[slot] > 0) {
+        people += minuteOccupancy[slot] * PEOPLE_TOTAL_HEAT;
+      } else {
+        people += sched.people;
+      }
       internalEquipment += sched.lighting + sched.equipment + sched.appliance;
     } else {
       // ── Density-based fallback (generic W/m²) ────────────────────────────
