@@ -360,7 +360,7 @@ app.get('/api/historical-temp', async (req, res) => {
 // excludeAssets / includeAssets: same semantics as getHourlyAvgsForDate
 async function getHourlyAcOutputForDate(dbZones, date, excludeAssets = [], includeAssets = []) {
   const result = await db.query(`
-    SELECT hour, SUM(avg_ac_output)::FLOAT AS total_watts
+    SELECT hour, COALESCE(SUM(avg_ac_output), 0)::FLOAT AS total_watts
     FROM (
       SELECT
         EXTRACT(HOUR FROM ((synced_at::TIMESTAMP) + INTERVAL '5 hours 30 minutes'))::INT AS hour,
@@ -368,11 +368,13 @@ async function getHourlyAcOutputForDate(dbZones, date, excludeAssets = [], inclu
         AVG(
           CASE WHEN UPPER(ac_power_status) = 'ON' THEN
             CASE
-              WHEN COALESCE(r_phase_power::FLOAT, 0) + COALESCE(y_phase_power::FLOAT, 0) + COALESCE(b_phase_power::FLOAT, 0) > 0
-                THEN COALESCE(r_phase_power::FLOAT, 0) + COALESCE(y_phase_power::FLOAT, 0) + COALESCE(b_phase_power::FLOAT, 0)
-              ELSE COALESCE(power::FLOAT, 0)
+              WHEN COALESCE(NULLIF(r_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(y_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(b_phase_power::FLOAT,'NaN'::FLOAT),0) > 0
+                THEN COALESCE(NULLIF(r_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(y_phase_power::FLOAT,'NaN'::FLOAT),0) + COALESCE(NULLIF(b_phase_power::FLOAT,'NaN'::FLOAT),0)
+              WHEN COALESCE(NULLIF(power::FLOAT,'NaN'::FLOAT), 0) > 0
+                THEN COALESCE(NULLIF(power::FLOAT,'NaN'::FLOAT), 0)
+              ELSE NULL
             END
-          ELSE 0
+          ELSE NULL
           END
         ) AS avg_ac_output
       FROM public.lt_bangalore_org_live_device_data
